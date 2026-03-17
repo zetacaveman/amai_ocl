@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aimai-ocl"
+version = "0.1.0"
+description = "Organizational control layer and multi-agent coordination project built on top of AgenticPay"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+packages = ["aimai_ocl"]
+
+[tool.setuptools.package-data]
+aimai_ocl = ["py.typed"]
