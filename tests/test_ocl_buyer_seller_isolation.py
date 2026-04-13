@@ -1,35 +1,22 @@
-"""Regression tests for buyer/seller control-path isolation.
-
-中文翻译：Regression tests for buyer/seller control-path isolation。"""
+"""Regression tests for buyer/seller control-path isolation."""
 
 from __future__ import annotations
 
 import unittest
 from typing import Any
 
-import aimai_ocl.adapters.agenticpay_env as env_mod
-from aimai_ocl.runners.ocl_episode import run_ocl_negotiation_episode
-from aimai_ocl.schemas.audit import AuditEventType
+import aimai_ocl.adapters as adapters_mod
+from aimai_ocl.runner import run_episode
+from aimai_ocl.schemas import AuditEventType
 
 
 class _DummyEnv:
-    """One-step dummy env for control-path isolation tests.
-
-中文翻译：One-step dummy env for control-path isolation tests。"""
+    """One-step dummy env for control-path isolation tests."""
 
     def __init__(self) -> None:
-        """Output: initializes round counter.
-
-中文翻译：输出：initializes round counter。"""
         self.round = 0
 
     def reset(self, **kwargs: Any) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Input: optional reset kwargs.
-
-        Output: deterministic initial observation/info.
-        
-
-        中文翻译：输入：optional reset kwargs。"""
         self.round = 0
         return {"current_round": 0, "conversation_history": []}, {}
 
@@ -38,12 +25,6 @@ class _DummyEnv:
         buyer_action: str | None = None,
         seller_action: str | None = None,
     ) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
-        """Input: buyer/seller action strings from runner.
-
-        Output: terminal transition tuple with fixed metrics.
-        
-
-        中文翻译：输入：buyer/seller action strings from runner。"""
         self.round += 1
         terminated = self.round >= 1
         obs = {"current_round": self.round, "conversation_history": []}
@@ -63,21 +44,13 @@ class _DummyEnv:
         return obs, 0.0, terminated, False, info
 
     def close(self) -> None:
-        """Output: no-op close for adapter compatibility.
-
-中文翻译：输出：no-op close for adapter compatibility。"""
         return None
 
 
 class _DummyAgent:
-    """Agent stub returning a deterministic utterance.
-
-中文翻译：Agent stub returning a deterministic utterance。"""
+    """Agent stub returning a deterministic utterance."""
 
     def __init__(self, name: str) -> None:
-        """Input: stable actor name for trace assertions.
-
-中文翻译：输入：stable actor name for trace assertions。"""
         self.name = name
 
     def respond(
@@ -85,19 +58,11 @@ class _DummyAgent:
         conversation_history: list[dict[str, Any]],
         current_state: dict[str, Any],
     ) -> str:
-        """Input: current history/state from runner.
-
-        Output: fixed negotiation string.
-        
-
-        中文翻译：输入：current history/state from runner。"""
         return "offer $100"
 
 
 class _RecordingSellerAgent(_DummyAgent):
-    """Seller stub that records the last received ``current_state``.
-
-中文翻译：Seller stub that records the last received ``current_state``。"""
+    """Seller stub that records the last received ``current_state``."""
 
     def __init__(self, name: str) -> None:
         super().__init__(name)
@@ -116,9 +81,7 @@ class _RecordingSellerAgent(_DummyAgent):
 
 
 class BuyerSellerIsolationTests(unittest.TestCase):
-    """Ensure buyer is pass-through while seller goes through OCL checks.
-
-中文翻译：确保 buyer is pass-through while seller goes through OCL checks。"""
+    """Ensure buyer is pass-through while seller goes through OCL checks."""
 
     def test_buyer_passthrough_seller_controlled(self) -> None:
         """Input: one-round OCL episode with buyer/seller stubs.
@@ -127,14 +90,12 @@ class BuyerSellerIsolationTests(unittest.TestCase):
         - buyer has no OCL action/constraint events
         - coordinator emits round-level assignment event
         - seller has constraint evaluation events
-        
-
-        中文翻译：输入：one-round OCL episode with buyer/seller stubs。"""
+        """
         seller = _RecordingSellerAgent("seller")
-        original_make_env = env_mod.make_env
-        env_mod.make_env = lambda env_id, **kwargs: _DummyEnv()
+        original_make_env = adapters_mod.make_env
+        adapters_mod.make_env = lambda env_id, **kwargs: _DummyEnv()
         try:
-            trace, _info = run_ocl_negotiation_episode(
+            trace, _info = run_episode(
                 env_id="Task1_basic_price_negotiation-v0",
                 buyer_agent=_DummyAgent("buyer"),
                 seller_agent=seller,
@@ -143,9 +104,10 @@ class BuyerSellerIsolationTests(unittest.TestCase):
                     "product_info": {"name": "x", "price": 100},
                     "user_profile": "demo",
                 },
+                ocl=True,
             )
         finally:
-            env_mod.make_env = original_make_env
+            adapters_mod.make_env = original_make_env
 
         buyer_constraint_events = [
             event

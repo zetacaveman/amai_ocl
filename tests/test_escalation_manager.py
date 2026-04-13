@@ -1,30 +1,24 @@
-"""Unit tests for escalation/replan policy manager.
-
-中文翻译：用于 escalation/replan policy manager 的单元测试。"""
+"""Unit tests for escalation/replan resolution."""
 
 from __future__ import annotations
 
 import unittest
 
-from aimai_ocl.controllers.escalation_manager import EscalationManager
-from aimai_ocl.schemas.actions import ActionIntent, ActionRole, RawAction
-from aimai_ocl.schemas.audit import AuditEventType
-from aimai_ocl.schemas.constraints import ViolationType
+from aimai_ocl.control import resolve_escalation
+from aimai_ocl.schemas import (
+    ActionIntent,
+    ActionRole,
+    AuditEventType,
+    ControlDecision,
+    ExecutableAction,
+    RawAction,
+)
 
 
-class EscalationManagerTests(unittest.TestCase):
-    """Coverage for step-7 escalation and deterministic replan logic.
-
-中文翻译：step-7 escalation and deterministic replan logic 的覆盖测试。"""
+class EscalationTests(unittest.TestCase):
+    """Coverage for escalation and deterministic replan logic."""
 
     def setUp(self) -> None:
-        """Input: none.
-
-        Output: fresh default escalation manager.
-        
-
-        中文翻译：输入：none。"""
-        self.manager = EscalationManager()
         self.raw = RawAction(
             actor_id="seller",
             actor_role=ActionRole.SELLER,
@@ -37,50 +31,50 @@ class EscalationManagerTests(unittest.TestCase):
         """Input: approved action without escalation flags.
 
         Expected output:
-        - strategy is direct_execute
         - final text is passthrough utterance
         - no escalation audit events
-        
-
-        中文翻译：输入：approved action without escalation flags。"""
-        outcome = self.manager.resolve(
-            round_id=1,
+        """
+        executable = ExecutableAction(
             actor_id="seller",
-            raw_action=self.raw,
+            actor_role=ActionRole.SELLER,
             approved=True,
-            requires_confirmation=False,
-            requires_escalation=False,
-            violations=[],
+            decision=ControlDecision.APPROVE,
+            final_text="I can do $130.",
+            intent=ActionIntent.NEGOTIATE_PRICE,
+            final_price=130.0,
+        )
+        final_text, events = resolve_escalation(
+            raw=self.raw,
+            executable=executable,
             state={"buyer_max_price": 120.0, "seller_min_price": 90.0},
         )
-        self.assertEqual("direct_execute", outcome.strategy)
-        self.assertEqual("I can do $130.", outcome.final_text)
-        self.assertEqual(0, len(outcome.audit_events))
+        self.assertEqual("I can do $130.", final_text)
+        self.assertEqual(0, len(events))
 
     def test_blocked_price_violation_produces_replan(self) -> None:
         """Input: blocked budget violation with feasible price interval.
 
         Expected output:
-        - strategy is replan_and_retry
-        - replan text is emitted
+        - replanned text with clamped price
         - escalation + replan events are both recorded
-        
-
-        中文翻译：输入：blocked budget violation with feasible price interval。"""
-        outcome = self.manager.resolve(
-            round_id=2,
+        """
+        executable = ExecutableAction(
             actor_id="seller",
-            raw_action=self.raw,
+            actor_role=ActionRole.SELLER,
             approved=False,
-            requires_confirmation=False,
-            requires_escalation=False,
-            violations=[ViolationType.BUDGET_EXCEEDED.value],
-            state={"buyer_max_price": 120.0, "seller_min_price": 90.0},
-            allow_replan=True,
+            decision=ControlDecision.BLOCK,
+            final_text="",
+            intent=ActionIntent.NEGOTIATE_PRICE,
+            requires_escalation=True,
         )
-        self.assertEqual("replan_and_retry", outcome.strategy)
-        self.assertEqual("I can revise to $120.00.", outcome.replan_text)
-        event_types = [event.event_type for event in outcome.audit_events]
+        final_text, events = resolve_escalation(
+            raw=self.raw,
+            executable=executable,
+            state={"buyer_max_price": 120.0, "seller_min_price": 90.0},
+            enable_replan=True,
+        )
+        self.assertEqual("I can revise to $120.00.", final_text)
+        event_types = [event.event_type for event in events]
         self.assertIn(AuditEventType.ESCALATION_TRIGGERED, event_types)
         self.assertIn(AuditEventType.REPLAN_APPLIED, event_types)
 
@@ -88,31 +82,27 @@ class EscalationManagerTests(unittest.TestCase):
         """Input: blocked floor/budget conflict with infeasible interval.
 
         Expected output:
-        - strategy is human_handoff
-        - no replan text
-        - escalation event contains strategy metadata
-        
-
-        中文翻译：输入：blocked floor/budget conflict with infeasible interval。"""
-        outcome = self.manager.resolve(
-            round_id=3,
+        - no final text (human handoff)
+        - escalation event emitted
+        """
+        executable = ExecutableAction(
             actor_id="seller",
-            raw_action=self.raw,
+            actor_role=ActionRole.SELLER,
             approved=False,
-            requires_confirmation=False,
-            requires_escalation=False,
-            violations=[ViolationType.BUDGET_EXCEEDED.value],
+            decision=ControlDecision.BLOCK,
+            final_text="",
+            intent=ActionIntent.NEGOTIATE_PRICE,
+            requires_escalation=True,
+        )
+        final_text, events = resolve_escalation(
+            raw=self.raw,
+            executable=executable,
             state={"buyer_max_price": 80.0, "seller_min_price": 90.0},
-            allow_replan=True,
+            enable_replan=True,
         )
-        self.assertEqual("human_handoff", outcome.strategy)
-        self.assertIsNone(outcome.replan_text)
-        self.assertTrue(outcome.requires_human_handoff)
-        self.assertEqual(1, len(outcome.audit_events))
-        self.assertEqual(
-            "human_handoff",
-            outcome.audit_events[0].metadata.get("strategy"),
-        )
+        self.assertIsNone(final_text)
+        self.assertEqual(1, len(events))
+        self.assertEqual(AuditEventType.ESCALATION_TRIGGERED, events[0].event_type)
 
 
 if __name__ == "__main__":
