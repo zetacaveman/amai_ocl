@@ -1,0 +1,21 @@
+inherit: default.yaml
+mode: ablation
+
+base:
+  arms: [single, ocl_full]
+  episodes_per_arm: 20
+
+variants:
+  - name: ocl_strict
+    control:
+      risk_rewrite_threshold: 0.35
+      risk_block_threshold: 0.60
+  - name: ocl_lenient
+    control:
+      risk_rewrite_threshold: 0.55
+      risk_block_threshold: 0.85
+  - name: ocl_no_replan
+    control:
+      enable_replan: false
+  - name: ocl_seller_only
+    coordinator_mode: seller_only

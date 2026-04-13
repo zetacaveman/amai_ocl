@@ -1,0 +1,19 @@
+provider: openai
+model: gpt-4o-mini
+api_key_env: OPENAI_API_KEY
+
+environment:
+  env_id: Task1_basic_price_negotiation-v0
+  max_rounds: 10
+  seed: 42
+
+pricing:
+  initial_seller_price: 180.0
+  buyer_max_price: 120.0
+  seller_min_price: 90.0
+
+scenario:
+  user_requirement: "I need a winter jacket"
+  product_name: "Winter Jacket"
+  product_price: 180.0
+  user_profile: "Budget-conscious and compares options before buying."

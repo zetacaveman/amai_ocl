@@ -1,0 +1,8 @@
+inherit: default.yaml
+mode: batch
+arms: [single, ocl_full]
+episodes_per_arm: 20
+
+stats:
+  bootstrap_samples: 2000
+  permutation_samples: 20000
