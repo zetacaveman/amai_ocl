@@ -1,0 +1,4 @@
+inherit: default.yaml
+mode: shapley
+seeds: [42]
+roles: [platform, seller, expert]

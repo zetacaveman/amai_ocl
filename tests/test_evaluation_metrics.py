@@ -1,24 +1,26 @@
-"""Tests for batch evaluation metric utility functions.
-
-中文翻译：用于批量评估指标工具函数的测试。"""
+"""Tests for batch evaluation metric utility functions."""
 
 from __future__ import annotations
 
 import unittest
 
-from aimai_ocl.evaluation_metrics import (
+from aimai_ocl.statistics import (
     collect_violation_stats,
     success_from_status,
     summarize_records,
 )
-from aimai_ocl.schemas.audit import AuditEvent, AuditEventType, EpisodeTrace
-from aimai_ocl.schemas.constraints import ConstraintCheck, ConstraintSeverity, ViolationType
+from aimai_ocl.schemas import (
+    AuditEvent,
+    AuditEventType,
+    ConstraintCheck,
+    ConstraintSeverity,
+    EpisodeTrace,
+    ViolationType,
+)
 
 
 class EvaluationMetricTests(unittest.TestCase):
-    """Coverage for violation extraction and arm-level summary math.
-
-中文翻译：覆盖 violation 提取与实验臂汇总计算相关逻辑。"""
+    """Coverage for violation extraction and arm-level summary math."""
 
     def test_collect_violation_stats_counts_constraint_events_once(self) -> None:
         trace = EpisodeTrace(episode_id="ep-1", env_id="Task1_basic_price_negotiation-v0")
@@ -36,7 +38,6 @@ class EvaluationMetricTests(unittest.TestCase):
             ),
         ]
         # Count this event.
-        # 中文：该事件应被计入统计。
         trace.add_event(
             AuditEvent(
                 event_type=AuditEventType.CONSTRAINT_EVALUATED,
@@ -45,7 +46,6 @@ class EvaluationMetricTests(unittest.TestCase):
             )
         )
         # Do not double-count this event.
-        # 中文：该事件不应重复计数。
         trace.add_event(
             AuditEvent(
                 event_type=AuditEventType.ACTION_EXECUTED,
@@ -134,9 +134,7 @@ class EvaluationMetricTests(unittest.TestCase):
 
         Expected output:
         - seller-side violation is still counted by normalized actor-id match
-        
-
-        中文翻译：输入：trace 事件中的 actor id 与过滤条件大小写不同。"""
+        """
         trace = EpisodeTrace(episode_id="ep-2", env_id="Task1_basic_price_negotiation-v0")
         trace.add_event(
             AuditEvent(

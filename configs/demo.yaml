@@ -1,0 +1,4 @@
+inherit: default.yaml
+mode: demo
+arms: [single]
+episodes: 1

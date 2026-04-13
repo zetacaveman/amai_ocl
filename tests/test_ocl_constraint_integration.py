@@ -1,22 +1,17 @@
-"""Integration test for OCL constraint blocking in episode execution.
-
-中文翻译：Integration test for OCL constraint blocking in episode execution。"""
+"""Integration test for OCL constraint blocking in episode execution."""
 
 from __future__ import annotations
 
 import unittest
 from typing import Any
 
-import aimai_ocl.adapters.agenticpay_env as env_mod
-from aimai_ocl.runners.ocl_episode import run_ocl_negotiation_episode
-from aimai_ocl.schemas.audit import AuditEventType
-from aimai_ocl.schemas.constraints import ViolationType
+import aimai_ocl.adapters as adapters_mod
+from aimai_ocl.runner import run_episode
+from aimai_ocl.schemas import AuditEventType, ViolationType
 
 
 class _InspectEnv:
-    """Minimal env that records last stepped actions for assertions.
-
-中文翻译：Minimal env that records last stepped actions for assertions。"""
+    """Minimal env that records last stepped actions for assertions."""
 
     def __init__(self) -> None:
         self.round = 0
@@ -24,12 +19,6 @@ class _InspectEnv:
         self.last_seller_action: str | None = None
 
     def reset(self, **kwargs: Any) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Input: optional reset kwargs from runner.
-
-        Output: one-step observation/info tuple with empty history.
-        
-
-        中文翻译：输入：optional reset kwargs from runner。"""
         self.round = 0
         self.last_buyer_action = None
         self.last_seller_action = None
@@ -40,12 +29,6 @@ class _InspectEnv:
         buyer_action: str | None = None,
         seller_action: str | None = None,
     ) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
-        """Input: buyer/seller action texts from runner.
-
-        Output: terminal one-step transition plus deterministic ``info`` payload.
-        
-
-        中文翻译：输入：buyer/seller action texts from runner。"""
         self.last_buyer_action = buyer_action
         self.last_seller_action = seller_action
         self.round += 1
@@ -70,9 +53,7 @@ class _InspectEnv:
 
 
 class _ConstAgent:
-    """Deterministic stub agent returning one fixed utterance.
-
-中文翻译：Deterministic stub agent returning one fixed utterance。"""
+    """Deterministic stub agent returning one fixed utterance."""
 
     def __init__(self, name: str, utterance: str) -> None:
         self.name = name
@@ -83,19 +64,11 @@ class _ConstAgent:
         conversation_history: list[dict[str, Any]],
         current_state: dict[str, Any],
     ) -> str:
-        """Input: conversation/state from runner loop.
-
-        Output: preconfigured utterance string.
-        
-
-        中文翻译：输入：conversation/state from runner loop。"""
         return self.utterance
 
 
 class OCLConstraintIntegrationTests(unittest.TestCase):
-    """Ensure hard constraints affect runner execution and audit outputs.
-
-中文翻译：确保 hard constraints affect runner execution and audit outputs。"""
+    """Ensure hard constraints affect runner execution and audit outputs."""
 
     def test_budget_violation_triggers_replan_and_records_trace(self) -> None:
         """Input: seller proposes price above buyer cap (130 > 120).
@@ -105,9 +78,7 @@ class OCLConstraintIntegrationTests(unittest.TestCase):
         - replanned seller action is executed with bounded price
         - trace includes seller-side constraint evaluation + budget violation
         - final_info/trace final status are still populated by runner flow
-        
-
-        中文翻译：输入：seller proposes price above buyer cap (130 > 120)。"""
+        """
         created_envs: list[_InspectEnv] = []
 
         def _make_env(env_id: str, **kwargs: Any) -> _InspectEnv:
@@ -115,10 +86,10 @@ class OCLConstraintIntegrationTests(unittest.TestCase):
             created_envs.append(env)
             return env
 
-        original_make_env = env_mod.make_env
-        env_mod.make_env = _make_env
+        original_make_env = adapters_mod.make_env
+        adapters_mod.make_env = _make_env
         try:
-            trace, final_info = run_ocl_negotiation_episode(
+            trace, final_info = run_episode(
                 env_id="Task1_basic_price_negotiation-v0",
                 buyer_agent=_ConstAgent("buyer", "offer $100"),
                 seller_agent=_ConstAgent("seller", "final offer $130"),
@@ -132,9 +103,10 @@ class OCLConstraintIntegrationTests(unittest.TestCase):
                     "product_info": {"name": "x", "price": 100},
                     "user_profile": "demo",
                 },
+                ocl=True,
             )
         finally:
-            env_mod.make_env = original_make_env
+            adapters_mod.make_env = original_make_env
 
         self.assertEqual(1, len(created_envs))
         env = created_envs[0]

@@ -1,147 +1,64 @@
-"""Top-level package for AiMai OCL.
+"""AiMai OCL — Organizational Control Layer for multi-agent negotiation."""
 
-中文翻译：AiMai OCL 的顶层包。"""
-
-from aimai_ocl.adapters import AgenticPayEnvAdapter
-from aimai_ocl.agenticpay_runtime import load_agenticpay, make_env
-from aimai_ocl.attribution_shapley import (
-    CONTROLLED_ROLES,
-    ValueFunctionConfig,
-    compute_shapley,
-    compute_V,
-    fallback_policy,
-    run_episode,
-)
-from aimai_ocl.controllers import (
-    AuditPolicy,
-    BarrierRiskGate,
-    CoordinationPhase,
-    ConstraintEngine,
-    CoordinationPlan,
-    Coordinator,
-    EscalationManager,
-    EscalationOutcome,
-    OCLControlResult,
-    OCLController,
-    RiskGate,
-    RolePolicy,
-    SellerOnlyCoordinator,
-    StateMachineCoordinator,
-)
-from aimai_ocl.experiment_config import (
-    ARM_REGISTRY,
-    ArmConfig,
-    ExperimentConfig,
-    RunConfig,
-    resolve_arm,
-)
-from aimai_ocl.plugin_registry import (
-    ALGORITHM_BUNDLE_REGISTRY,
-    ALGORITHM_BUNDLE_SPEC_REGISTRY,
-    ATTRIBUTION_ALGORITHM_REGISTRY,
-    AUDIT_ALGORITHM_REGISTRY,
-    ESCALATION_ALGORITHM_REGISTRY,
-    EXPERIMENT_PROTOCOL_REGISTRY,
-    GATE_ALGORITHM_REGISTRY,
-    ROLE_ALGORITHM_REGISTRY,
-    AlgorithmBundle,
-    AlgorithmBundleSpec,
-    AttributionModule,
-    ExperimentProtocolBundle,
-    compose_algorithm_bundle,
-    resolve_attribution_algorithm,
-    resolve_algorithm_bundle,
-    resolve_audit_algorithm_factory,
-    resolve_escalation_algorithm_factory,
-    resolve_experiment_protocol,
-    resolve_gate_algorithm_factory,
-    resolve_role_algorithm_factory,
-)
-from aimai_ocl.model_runtime import (
-    ModelRuntimeConfig,
-    build_agenticpay_agents,
-    build_model_client,
-    resolve_model_runtime_config,
-)
-from aimai_ocl.runners import run_ocl_negotiation_episode, run_single_negotiation_episode
 from aimai_ocl.schemas import (
     ActionIntent,
     ActionRole,
     AuditEvent,
     AuditEventType,
-    ControlDecision,
     ConstraintCheck,
     ConstraintSeverity,
+    ControlDecision,
     EpisodeTrace,
     ExecutableAction,
     RawAction,
     ViolationType,
 )
+from aimai_ocl.control import (
+    AuditPolicy,
+    ControlConfig,
+    ControlResult,
+    apply_control,
+    resolve_escalation,
+)
+from aimai_ocl.coordinator import Coordinator, CoordinationPlan
+from aimai_ocl.runner import run_episode
+from aimai_ocl.attribution import (
+    CONTROLLED_ROLES,
+    ValueConfig,
+    compute_shapley,
+    compute_V,
+    fallback_policy,
+    run_masked_episode,
+)
+from aimai_ocl.experiment import (
+    ARMS,
+    ArmConfig,
+    ExperimentConfig,
+    RunConfig,
+    resolve_arm,
+)
+from aimai_ocl.config import load_config, load_experiment_yaml
+from aimai_ocl.adapters import EnvAdapter, build_agents, build_model_client
 
 __all__ = [
-    "ActionIntent",
-    "ActionRole",
-    "ALGORITHM_BUNDLE_REGISTRY",
-    "ALGORITHM_BUNDLE_SPEC_REGISTRY",
-    "AgenticPayEnvAdapter",
-    "AlgorithmBundle",
-    "AlgorithmBundleSpec",
-    "AttributionModule",
-    "ATTRIBUTION_ALGORITHM_REGISTRY",
-    "AUDIT_ALGORITHM_REGISTRY",
-    "AuditPolicy",
-    "AuditEvent",
-    "AuditEventType",
-    "ControlDecision",
-    "ESCALATION_ALGORITHM_REGISTRY",
-    "EXPERIMENT_PROTOCOL_REGISTRY",
-    "GATE_ALGORITHM_REGISTRY",
-    "ARM_REGISTRY",
-    "ArmConfig",
-    "CONTROLLED_ROLES",
-    "CoordinationPhase",
-    "BarrierRiskGate",
-    "ConstraintEngine",
-    "CoordinationPlan",
-    "Coordinator",
-    "EscalationManager",
-    "EscalationOutcome",
-    "ConstraintCheck",
-    "ConstraintSeverity",
-    "EpisodeTrace",
-    "ExperimentConfig",
-    "ExperimentProtocolBundle",
-    "ExecutableAction",
-    "OCLControlResult",
-    "OCLController",
-    "RawAction",
-    "RunConfig",
-    "ValueFunctionConfig",
-    "RiskGate",
-    "RolePolicy",
-    "SellerOnlyCoordinator",
-    "StateMachineCoordinator",
-    "ROLE_ALGORITHM_REGISTRY",
-    "ViolationType",
-    "compose_algorithm_bundle",
-    "compute_V",
-    "compute_shapley",
-    "fallback_policy",
-    "load_agenticpay",
-    "make_env",
-    "resolve_algorithm_bundle",
-    "resolve_audit_algorithm_factory",
-    "resolve_attribution_algorithm",
-    "resolve_escalation_algorithm_factory",
-    "resolve_arm",
-    "resolve_experiment_protocol",
-    "resolve_gate_algorithm_factory",
-    "resolve_role_algorithm_factory",
-    "ModelRuntimeConfig",
-    "build_agenticpay_agents",
-    "build_model_client",
-    "resolve_model_runtime_config",
+    # Schemas
+    "ActionIntent", "ActionRole", "AuditEvent", "AuditEventType",
+    "ConstraintCheck", "ConstraintSeverity", "ControlDecision",
+    "EpisodeTrace", "ExecutableAction", "RawAction", "ViolationType",
+    # Control
+    "AuditPolicy", "ControlConfig", "ControlResult",
+    "apply_control", "resolve_escalation",
+    # Coordinator
+    "Coordinator", "CoordinationPlan",
+    # Runner
     "run_episode",
-    "run_ocl_negotiation_episode",
-    "run_single_negotiation_episode",
+    # Attribution
+    "CONTROLLED_ROLES", "ValueConfig", "compute_shapley", "compute_V",
+    "fallback_policy", "run_masked_episode",
+    # Experiment
+    "ARMS", "ArmConfig", "ExperimentConfig", "RunConfig", "resolve_arm",
+    # Config
+    "load_config", "load_experiment_yaml",
+    # Adapters
+    "EnvAdapter", "build_agents", "build_model_client",
 ]

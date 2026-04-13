@@ -1,0 +1,8 @@
+inherit: default.yaml
+mode: paired
+arms: [single, ocl_full]
+units: 20
+
+stats:
+  bootstrap_samples: 2000
+  permutation_samples: 20000

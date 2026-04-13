@@ -1,6 +1,4 @@
-"""Tests for step-8 Shapley attribution interface module.
-
-中文翻译：用于 step-8 Shapley attribution interface module 的测试。"""
+"""Tests for Shapley attribution interface module."""
 
 from __future__ import annotations
 
@@ -8,23 +6,27 @@ from itertools import combinations
 import unittest
 from typing import Any
 
-import aimai_ocl.adapters.agenticpay_env as env_mod
-from aimai_ocl.attribution_shapley import (
+import aimai_ocl.adapters as adapters_mod
+from aimai_ocl.attribution import (
     CONTROLLED_ROLES,
-    ValueFunctionConfig,
+    ValueConfig,
     compute_shapley,
     compute_V,
     fallback_policy,
-    run_episode,
+    run_masked_episode,
 )
-from aimai_ocl.schemas.audit import AuditEvent, AuditEventType, EpisodeTrace
-from aimai_ocl.schemas.constraints import ConstraintCheck, ConstraintSeverity, ViolationType
+from aimai_ocl.schemas import (
+    AuditEvent,
+    AuditEventType,
+    ConstraintCheck,
+    ConstraintSeverity,
+    EpisodeTrace,
+    ViolationType,
+)
 
 
 class _DummyEnv:
-    """One-step env stub for run_episode interface test.
-
-中文翻译：One-step env stub for run_episode interface test。"""
+    """One-step env stub for run_masked_episode interface test."""
 
     def __init__(self) -> None:
         self.last_buyer_action: str | None = None
@@ -90,17 +92,13 @@ class _SellerAgent:
 
 
 class AttributionInterfaceTests(unittest.TestCase):
-    """Contract tests for run_episode / compute_V / fallback / shapley.
-
-中文翻译：run_episode / compute_V / fallback / shapley 的契约测试。"""
+    """Contract tests for run_masked_episode / compute_V / fallback / shapley."""
 
     def test_fallback_policy_is_deterministic(self) -> None:
         """Input: same role/state twice.
 
         Expected output: exactly same action text both times.
-        
-
-        中文翻译：输入：same role/state twice。"""
+        """
         state = {"buyer_max_price": 120.0, "seller_min_price": 90.0}
         a1 = fallback_policy("seller", state)
         a2 = fallback_policy("seller", state)
@@ -111,9 +109,7 @@ class AttributionInterfaceTests(unittest.TestCase):
         """Input: synthetic trace with reward/round/violations/escalation.
 
         Expected output: scalar value matches configured weighted formula.
-        
-
-        中文翻译：输入：synthetic trace with reward/round/violations/escalation。"""
+        """
         trace = EpisodeTrace(episode_id="ep-v", env_id="Task1_basic_price_negotiation-v0")
         trace.final_status = "agreed"
         trace.final_metrics = {"seller_reward": 10.0, "round": 4}
@@ -137,16 +133,14 @@ class AttributionInterfaceTests(unittest.TestCase):
                 actor_id="seller",
             )
         )
-        value = compute_V(trace, config=ValueFunctionConfig())
+        value = compute_V(trace, config=ValueConfig())
         self.assertAlmostEqual(12.4, value)
 
     def test_compute_shapley_exact_for_additive_game(self) -> None:
         """Input: additive coalition game over controlled roles.
 
         Expected output: exact shapley equals per-role additive contributions.
-        
-
-        中文翻译：输入：additive coalition game over controlled roles。"""
+        """
         contrib = {"platform": 2.0, "seller": 1.0, "expert": 3.0}
         values: dict[frozenset[str], float] = {}
         role_list = list(CONTROLLED_ROLES)
@@ -162,15 +156,13 @@ class AttributionInterfaceTests(unittest.TestCase):
         self.assertAlmostEqual(1.0 / 6.0, result["w"]["seller"])
         self.assertAlmostEqual(3.0 / 6.0, result["w"]["expert"])
 
-    def test_run_episode_supports_role_mask_and_returns_trace(self) -> None:
+    def test_run_masked_episode_supports_role_mask_and_returns_trace(self) -> None:
         """Input: role mask without seller role.
 
         Expected output:
         - seller action falls back to deterministic policy
         - returned object is a populated EpisodeTrace
-        
-
-        中文翻译：输入：role mask without seller role。"""
+        """
         created_envs: list[_DummyEnv] = []
 
         def _make_env(env_id: str, **kwargs: Any) -> _DummyEnv:
@@ -178,10 +170,10 @@ class AttributionInterfaceTests(unittest.TestCase):
             created_envs.append(env)
             return env
 
-        original_make_env = env_mod.make_env
-        env_mod.make_env = _make_env
+        original_make_env = adapters_mod.make_env
+        adapters_mod.make_env = _make_env
         try:
-            trace = run_episode(
+            trace = run_masked_episode(
                 role_mask=set(),
                 seed=7,
                 env_id="Task1_basic_price_negotiation-v0",
@@ -200,27 +192,27 @@ class AttributionInterfaceTests(unittest.TestCase):
                 },
             )
         finally:
-            env_mod.make_env = original_make_env
+            adapters_mod.make_env = original_make_env
 
         self.assertEqual(1, len(created_envs))
         self.assertEqual("[seller] deterministic offer $105.00", created_envs[0].last_seller_action)
         self.assertIsInstance(trace, EpisodeTrace)
         self.assertEqual([], trace.metadata.get("role_mask"))
 
-    def test_compute_shapley_raises_when_subset_values_incomplete(self) -> None:
-        """Input: coalition values missing required subsets.
+    def test_compute_shapley_gracefully_handles_sparse_subsets(self) -> None:
+        """Input: coalition values missing most subsets.
 
-        Expected output: exact Shapley computation raises ValueError.
-        
-
-        中文翻译：输入：coalition values missing required subsets。"""
-        with self.assertRaises(ValueError):
-            compute_shapley(
-                {
-                    frozenset(): 0.0,
-                    frozenset({"seller"}): 1.0,
-                }
-            )
+        Expected output: returns valid phi/w dicts (partial information).
+        """
+        result = compute_shapley(
+            {
+                frozenset(): 0.0,
+                frozenset({"seller"}): 1.0,
+            }
+        )
+        self.assertIn("phi", result)
+        self.assertIn("w", result)
+        self.assertEqual({"platform", "seller", "expert"}, set(result["phi"]))
 
 
 if __name__ == "__main__":
