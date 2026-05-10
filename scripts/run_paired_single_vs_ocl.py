@@ -57,8 +57,7 @@ from aimai_ocl import (
     run_single_negotiation_episode,
 )
 from aimai_ocl.evaluation_metrics import (
-    collect_violation_stats,
-    success_from_status,
+    build_episode_metrics,
 )
 from aimai_ocl.model_runtime import (
     build_agenticpay_agents,
@@ -127,6 +126,15 @@ def parse_args() -> argparse.Namespace:
         help="OpenAI model id, for example gpt-4o-mini.",
     )
     parser.add_argument(
+        "--gate-tau",
+        type=float,
+        default=DEFAULT_RUN.gate_tau,
+        help=(
+            "Gate control strength in [0,1]. Higher is stricter. "
+            "Currently applies to barrier-gate algorithms."
+        ),
+    )
+    parser.add_argument(
         "--scale",
         type=float,
         default=DEFAULT_SCORE_SCALE,
@@ -175,6 +183,7 @@ def _build_run_config(args: argparse.Namespace) -> RunConfig:
     return replace(
         DEFAULT_RUN,
         model=args.model,
+        gate_tau=args.gate_tau,
         seed=args.seed_base,
     )
 
@@ -213,6 +222,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--gamma must be in (0, 1].")
     if not (0.0 < args.discount_last_round_value <= 1.0):
         raise ValueError("--discount-last-round-value must be in (0, 1].")
+    if not (0.0 <= args.gate_tau <= 1.0):
+        raise ValueError("--gate-tau must be in [0, 1].")
 
 
 def _apply_seed(seed: int) -> None:
@@ -311,6 +322,7 @@ def _run_one(
         bundle_id=base_bundle.bundle_id,
         role_algorithm_id=arm.role_algorithm_id,
         gate_algorithm_id=arm.gate_algorithm_id,
+        gate_tau=run_config.gate_tau,
         escalation_algorithm_id=arm.escalation_algorithm_id,
         audit_algorithm_id=(audit_algorithm_override or arm.audit_algorithm_id),
         attribution_algorithm_id=arm.attribution_algorithm_id,
@@ -324,6 +336,7 @@ def _run_one(
         initial_seller_price=run_config.initial_seller_price,
         buyer_max_price=run_config.buyer_max_price,
         seller_min_price=run_config.seller_min_price,
+        gate_tau=run_config.gate_tau,
         user_requirement=run_config.user_requirement,
         product_name=run_config.product_name,
         product_price=run_config.product_price,
@@ -359,10 +372,12 @@ def _run_one(
             "trace_metadata": {
                 "arm_name": arm.name,
                 "runner_mode": arm.runner_mode,
+                "control_information_scope": arm.control_information_scope,
                 "config_digest": exp.digest(),
                 "seed": seeded_run.seed,
                 "unit_index": unit_index,
                 "paired_mode": True,
+                "gate_runtime_config": algorithm_bundle.gate_runtime_config,
             },
         }
         if arm.runner_mode == "ocl":
@@ -372,6 +387,7 @@ def _run_one(
                 coordinator=algorithm_bundle.make_role_algorithm(),
                 escalation_manager=algorithm_bundle.make_escalation_algorithm(),
                 audit_policy=algorithm_bundle.make_audit_algorithm(),
+                control_information_scope=arm.control_information_scope,
             )
         return run_single_negotiation_episode(
             **common_kwargs,
@@ -385,7 +401,14 @@ def _run_one(
             trace, final_info = _execute_one()
     latency_sec = time.perf_counter() - start
 
-    violation = collect_violation_stats(trace, actor_id="seller")
+    episode_metrics = build_episode_metrics(
+        trace=trace,
+        final_info=final_info,
+        latency_sec=latency_sec,
+        actor_id="seller",
+        buyer_max_price=seeded_run.buyer_max_price,
+        seller_min_price=seeded_run.seller_min_price,
+    )
     trace_path: str | None = None
     if traces_dir is not None:
         trace_file = traces_dir / (
@@ -401,6 +424,12 @@ def _run_one(
         "algorithm_bundle_id": arm.algorithm_bundle_id,
         "role_algorithm_id": algorithm_bundle.role_algorithm_id,
         "gate_algorithm_id": algorithm_bundle.gate_algorithm_id,
+        "gate_tau": algorithm_bundle.gate_runtime_config.get("gate_tau"),
+        "gate_family": algorithm_bundle.gate_runtime_config.get("gate_family"),
+        "gate_tau_applied": algorithm_bundle.gate_runtime_config.get("tau_applied"),
+        "rewrite_threshold": algorithm_bundle.gate_runtime_config.get("rewrite_threshold"),
+        "block_threshold": algorithm_bundle.gate_runtime_config.get("block_threshold"),
+        "epsilon_miss": algorithm_bundle.gate_runtime_config.get("epsilon_miss"),
         "escalation_algorithm_id": algorithm_bundle.escalation_algorithm_id,
         "audit_algorithm_id": algorithm_bundle.audit_algorithm_id,
         "attribution_algorithm_id": algorithm_bundle.attribution_algorithm_id,
@@ -411,20 +440,10 @@ def _run_one(
         "config_digest": exp.digest(),
         "episode_id": trace.episode_id,
         "status": final_info.get("status"),
-        "success": success_from_status(final_info.get("status")),
-        "round": final_info.get("round"),
         "termination_reason": final_info.get("termination_reason"),
-        "seller_reward": final_info.get("seller_reward"),
-        "buyer_reward": final_info.get("buyer_reward"),
-        "global_score": final_info.get("global_score"),
-        "seller_score": final_info.get("seller_score"),
-        "buyer_score": final_info.get("buyer_score"),
-        "latency_sec": latency_sec,
         "audit_events": len(trace.events),
-        "failed_constraint_count": violation["failed_constraint_count"],
-        "has_violation": int(violation["has_violation"]),
-        "escalation_count": violation["escalation_count"],
-        "violation_type_counts": violation["violation_type_counts"],
+        **episode_metrics,
+        "has_violation": int(episode_metrics["has_violation"]),
         "trace_json": trace_path,
     }
 
@@ -892,6 +911,12 @@ def main() -> int:
             "algorithm_bundle_id",
             "role_algorithm_id",
             "gate_algorithm_id",
+            "gate_tau",
+            "gate_family",
+            "gate_tau_applied",
+            "rewrite_threshold",
+            "block_threshold",
+            "epsilon_miss",
             "escalation_algorithm_id",
             "audit_algorithm_id",
             "attribution_algorithm_id",
@@ -903,6 +928,10 @@ def main() -> int:
             "episode_id",
             "status",
             "success",
+            "env_success",
+            "strict_success",
+            "feasibility",
+            "price_feasible",
             "round",
             "termination_reason",
             "discounted_success_points",
@@ -911,14 +940,25 @@ def main() -> int:
             "seller_reward",
             "buyer_reward",
             "global_score",
+            "welfare",
+            "cost_adjusted_welfare",
             "seller_score",
             "buyer_score",
             "latency_sec",
             "audit_events",
+            "total_constraint_check_count",
+            "passed_constraint_count",
             "failed_constraint_count",
+            "executed_failed_constraint_count",
+            "constraint_satisfaction_rate",
             "has_violation",
+            "transient_has_violation",
+            "executed_has_violation",
+            "recovered_has_violation",
+            "unrecovered_has_violation",
             "escalation_count",
             "violation_type_counts",
+            "executed_violation_type_counts",
             "trace_json",
         ],
     )

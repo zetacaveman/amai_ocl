@@ -12,7 +12,7 @@ Design goals:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import random
 from statistics import mean
@@ -34,11 +34,15 @@ from aimai_ocl.controllers import (
     AuditPolicy,
     BarrierRiskGate,
     Coordinator,
+    DisabledEscalationManager,
     EscalationManager,
     OCLController,
     RiskGate,
     SellerOnlyCoordinator,
     StateMachineCoordinator,
+    TauControlledRiskGate,
+    barrier_config_from_tau,
+    tau_control_surface_from_tau,
 )
 from aimai_ocl.schemas.actions import ActionIntent, RawAction
 from aimai_ocl.schemas.audit import AuditEvent, AuditEventType, EpisodeTrace
@@ -199,6 +203,8 @@ class AlgorithmBundle:
     compute_V_fn: Callable[..., float]
     fallback_policy_fn: Callable[[str, Mapping[str, Any]], str]
     compute_shapley_fn: Callable[..., dict[str, dict[str, float]]]
+    gate_tau: float | None = None
+    gate_runtime_config: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,24 +252,56 @@ def _make_lenient_gate_algorithm() -> OCLController:
     )
 
 
-def _make_barrier_gate_algorithm() -> OCLController:
+def _make_off_gate_algorithm() -> OCLController:
     return OCLController(
-        risk_gate=BarrierRiskGate(
-            rewrite_threshold=0.45,
-            block_threshold=0.75,
-            epsilon_miss=0.10,
+        risk_gate=RiskGate(
+            high_risk_intents=(),
+            require_confirmation_for_high_risk=False,
         )
     )
 
 
-def _make_barrier_strict_gate_algorithm() -> OCLController:
+_BARRIER_GATE_PRESET_CONFIGS: dict[str, dict[str, float]] = {
+    "gate_v2_barrier": {
+        "rewrite_threshold": 0.45,
+        "block_threshold": 0.75,
+        "epsilon_miss": 0.10,
+    },
+    "gate_v2_barrier_strict": {
+        "rewrite_threshold": 0.35,
+        "block_threshold": 0.60,
+        "epsilon_miss": 0.05,
+    },
+}
+
+
+def _make_barrier_gate_algorithm(
+    *,
+    rewrite_threshold: float,
+    block_threshold: float,
+    epsilon_miss: float,
+) -> OCLController:
     return OCLController(
         risk_gate=BarrierRiskGate(
-            rewrite_threshold=0.35,
-            block_threshold=0.60,
-            epsilon_miss=0.05,
+            rewrite_threshold=rewrite_threshold,
+            block_threshold=block_threshold,
+            epsilon_miss=epsilon_miss,
         )
     )
+
+
+def _make_tau_controlled_gate_algorithm(
+    *,
+    gate_tau: float,
+) -> OCLController:
+    return OCLController(
+        risk_gate=TauControlledRiskGate.from_tau(gate_tau=gate_tau)
+    )
+
+
+def _make_barrier_gate_algorithm_from_preset(gate_algorithm_id: str) -> OCLController:
+    params = _BARRIER_GATE_PRESET_CONFIGS[gate_algorithm_id]
+    return _make_barrier_gate_algorithm(**params)
 
 
 def _make_default_escalation_algorithm() -> EscalationManager:
@@ -272,6 +310,10 @@ def _make_default_escalation_algorithm() -> EscalationManager:
 
 def _make_no_replan_escalation_algorithm() -> EscalationManager:
     return EscalationManager(enable_replan=False)
+
+
+def _make_off_escalation_algorithm() -> DisabledEscalationManager:
+    return DisabledEscalationManager()
 
 
 def _make_full_audit_algorithm() -> AuditPolicy:
@@ -328,15 +370,20 @@ ROLE_ALGORITHM_REGISTRY: dict[str, Callable[[], RoleAlgorithm]] = {
 
 
 GATE_ALGORITHM_REGISTRY: dict[str, Callable[[], GateAlgorithm]] = {
+    "gate_v0_off": _make_off_gate_algorithm,
     "gate_v1_default": _make_default_gate_algorithm,
     "gate_v1_strict": _make_strict_gate_algorithm,
     "gate_v1_lenient": _make_lenient_gate_algorithm,
-    "gate_v2_barrier": _make_barrier_gate_algorithm,
-    "gate_v2_barrier_strict": _make_barrier_strict_gate_algorithm,
+    "gate_v2_barrier": lambda: _make_barrier_gate_algorithm_from_preset("gate_v2_barrier"),
+    "gate_v2_barrier_strict": (
+        lambda: _make_barrier_gate_algorithm_from_preset("gate_v2_barrier_strict")
+    ),
+    "gate_v3_tau_controlled": lambda: _make_tau_controlled_gate_algorithm(gate_tau=0.5),
 }
 
 
 ESCALATION_ALGORITHM_REGISTRY: dict[str, Callable[[], EscalationAlgorithm]] = {
+    "escalation_v0_off": _make_off_escalation_algorithm,
     "escalation_v1_default": _make_default_escalation_algorithm,
     "escalation_v1_no_replan": _make_no_replan_escalation_algorithm,
 }
@@ -389,11 +436,11 @@ ALGORITHM_BUNDLE_SPEC_REGISTRY: dict[str, AlgorithmBundleSpec] = {
     "v1_default": AlgorithmBundleSpec(
         bundle_id="v1_default",
         description=(
-            "Rule-based role decomposition + default gate + default escalation + "
+            "Rule-based role decomposition + tau-controlled gate + default escalation + "
             "full audit + exact Shapley attribution."
         ),
         role_algorithm_id="role_v1_rule",
-        gate_algorithm_id="gate_v1_default",
+        gate_algorithm_id="gate_v3_tau_controlled",
         escalation_algorithm_id="escalation_v1_default",
         audit_algorithm_id="audit_v1_full",
         attribution_algorithm_id="shapley_v1_exact",
@@ -401,11 +448,11 @@ ALGORITHM_BUNDLE_SPEC_REGISTRY: dict[str, AlgorithmBundleSpec] = {
     "v1_role_ablation": AlgorithmBundleSpec(
         bundle_id="v1_role_ablation",
         description=(
-            "Seller-only coordination ablation with default gate/escalation/"
+            "Seller-only coordination ablation with tau-controlled gate/escalation/"
             "attribution."
         ),
         role_algorithm_id="role_v1_seller_only",
-        gate_algorithm_id="gate_v1_default",
+        gate_algorithm_id="gate_v3_tau_controlled",
         escalation_algorithm_id="escalation_v1_default",
         audit_algorithm_id="audit_v1_full",
         attribution_algorithm_id="shapley_v1_exact",
@@ -413,11 +460,11 @@ ALGORITHM_BUNDLE_SPEC_REGISTRY: dict[str, AlgorithmBundleSpec] = {
     "v2_research": AlgorithmBundleSpec(
         bundle_id="v2_research",
         description=(
-            "State-machine role decomposition + barrier risk gating + full audit + "
+            "State-machine role decomposition + tau-controlled risk gating + full audit + "
             "counterfactual attribution."
         ),
         role_algorithm_id="role_v2_state_machine",
-        gate_algorithm_id="gate_v2_barrier",
+        gate_algorithm_id="gate_v3_tau_controlled",
         escalation_algorithm_id="escalation_v1_default",
         audit_algorithm_id="audit_v1_full",
         attribution_algorithm_id="counterfactual_v1",
@@ -438,10 +485,67 @@ def resolve_role_algorithm_factory(role_algorithm_id: str) -> Callable[[], RoleA
         ) from exc
 
 
-def resolve_gate_algorithm_factory(gate_algorithm_id: str) -> Callable[[], GateAlgorithm]:
+def describe_gate_algorithm_runtime(
+    gate_algorithm_id: str,
+    *,
+    gate_tau: float | None = None,
+) -> dict[str, Any]:
+    """Describe resolved runtime gate parameters for logging and traces.
+
+    中文翻译：描述运行时 gate 参数，用于日志与 trace。"""
+    if gate_algorithm_id in _BARRIER_GATE_PRESET_CONFIGS:
+        params = (
+            barrier_config_from_tau(gate_tau)
+            if gate_tau is not None
+            else dict(_BARRIER_GATE_PRESET_CONFIGS[gate_algorithm_id])
+        )
+        return {
+            "gate_family": "barrier",
+            "tau_applied": gate_tau is not None,
+            "gate_tau": params.get("gate_tau"),
+            "rewrite_threshold": params["rewrite_threshold"],
+            "block_threshold": params["block_threshold"],
+            "epsilon_miss": params["epsilon_miss"],
+        }
+    if gate_algorithm_id == "gate_v3_tau_controlled":
+        surface = tau_control_surface_from_tau(0.5 if gate_tau is None else gate_tau)
+        return surface.to_runtime_config()
+    return {
+        "gate_family": "legacy",
+        "tau_applied": False,
+        "gate_tau": gate_tau,
+        "rewrite_threshold": None,
+        "block_threshold": None,
+        "epsilon_miss": None,
+    }
+
+
+def resolve_gate_algorithm_factory(
+    gate_algorithm_id: str,
+    *,
+    gate_tau: float | None = None,
+) -> Callable[[], GateAlgorithm]:
     """Resolve risk-gate/controller algorithm factory by id.
 
 中文翻译：解析 risk-gate/controller algorithm factory by id。"""
+    if gate_algorithm_id in _BARRIER_GATE_PRESET_CONFIGS and gate_tau is not None:
+        params = barrier_config_from_tau(gate_tau)
+
+        def _factory() -> GateAlgorithm:
+            return _make_barrier_gate_algorithm(
+                rewrite_threshold=params["rewrite_threshold"],
+                block_threshold=params["block_threshold"],
+                epsilon_miss=params["epsilon_miss"],
+            )
+
+        return _factory
+    if gate_algorithm_id == "gate_v3_tau_controlled":
+        resolved_tau = 0.5 if gate_tau is None else gate_tau
+
+        def _factory() -> GateAlgorithm:
+            return _make_tau_controlled_gate_algorithm(gate_tau=resolved_tau)
+
+        return _factory
     try:
         return GATE_ALGORITHM_REGISTRY[gate_algorithm_id]
     except KeyError as exc:
@@ -499,6 +603,7 @@ def compose_algorithm_bundle(
     bundle_id: str,
     role_algorithm_id: str | None = None,
     gate_algorithm_id: str | None = None,
+    gate_tau: float | None = None,
     escalation_algorithm_id: str | None = None,
     audit_algorithm_id: str | None = None,
     attribution_algorithm_id: str | None = None,
@@ -521,7 +626,14 @@ def compose_algorithm_bundle(
     resolved_attr_id = attribution_algorithm_id or spec.attribution_algorithm_id
 
     role_factory = resolve_role_algorithm_factory(resolved_role_id)
-    gate_factory = resolve_gate_algorithm_factory(resolved_gate_id)
+    gate_factory = resolve_gate_algorithm_factory(
+        resolved_gate_id,
+        gate_tau=gate_tau,
+    )
+    gate_runtime_config = describe_gate_algorithm_runtime(
+        resolved_gate_id,
+        gate_tau=gate_tau,
+    )
     escalation_factory = resolve_escalation_algorithm_factory(resolved_escalation_id)
     audit_factory = resolve_audit_algorithm_factory(resolved_audit_id)
     attribution_module = resolve_attribution_algorithm(resolved_attr_id)
@@ -534,6 +646,8 @@ def compose_algorithm_bundle(
         escalation_algorithm_id=resolved_escalation_id,
         audit_algorithm_id=resolved_audit_id,
         attribution_algorithm_id=resolved_attr_id,
+        gate_tau=gate_runtime_config.get("gate_tau"),
+        gate_runtime_config=gate_runtime_config,
         make_role_algorithm=role_factory,
         make_gate_algorithm=gate_factory,
         make_escalation_algorithm=escalation_factory,
@@ -563,6 +677,86 @@ def _to_float(value: Any) -> float:
 
 def _summary_index(summaries: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return {str(row.get("arm")): row for row in summaries if row.get("arm") is not None}
+
+
+_MAIN_RESULT_METRIC_SPECS: dict[str, dict[str, Any]] = {
+    "success": {
+        "summary_key": "success_rate",
+        "label": "success_rate",
+        "direction": 1,
+    },
+    "feasibility": {
+        "summary_key": "feasibility_rate",
+        "label": "feasibility_rate",
+        "direction": 1,
+    },
+    "has_violation": {
+        "summary_key": "violation_rate",
+        "label": "transient_violation_rate",
+        "direction": -1,
+    },
+    "transient_has_violation": {
+        "summary_key": "transient_violation_rate",
+        "label": "transient_violation_rate",
+        "direction": -1,
+    },
+    "executed_has_violation": {
+        "summary_key": "executed_violation_rate",
+        "label": "executed_violation_rate",
+        "direction": -1,
+    },
+    "unrecovered_has_violation": {
+        "summary_key": "unrecovered_violation_rate",
+        "label": "unrecovered_violation_rate",
+        "direction": -1,
+    },
+    "constraint_satisfaction_rate": {
+        "summary_key": "avg_constraint_satisfaction_rate",
+        "label": "constraint_satisfaction_rate",
+        "direction": 1,
+    },
+    "round": {
+        "summary_key": "avg_round",
+        "label": "avg_round",
+        "direction": -1,
+    },
+    "seller_reward": {
+        "summary_key": "avg_seller_reward",
+        "label": "avg_seller_reward",
+        "direction": 1,
+    },
+    "global_score": {
+        "summary_key": "avg_global_score",
+        "label": "avg_global_score",
+        "direction": 1,
+    },
+    "welfare": {
+        "summary_key": "avg_welfare",
+        "label": "avg_welfare",
+        "direction": 1,
+    },
+    "cost_adjusted_welfare": {
+        "summary_key": "avg_cost_adjusted_welfare",
+        "label": "avg_cost_adjusted_welfare",
+        "direction": 1,
+    },
+    "escalation_count": {
+        "summary_key": "avg_escalation_count",
+        "label": "avg_escalation_count",
+        "direction": -1,
+    },
+    "latency_sec": {
+        "summary_key": "avg_latency_sec",
+        "label": "avg_latency_sec",
+        "direction": -1,
+    },
+}
+
+
+def _metric_direction(metric_key: str) -> int:
+    spec = _MAIN_RESULT_METRIC_SPECS.get(metric_key, {})
+    direction = int(spec.get("direction", 1))
+    return 1 if direction >= 0 else -1
 
 
 def _mean(values: list[float]) -> float | None:
@@ -724,16 +918,26 @@ def _paired_metric_stats(
         baseline_arm=baseline_arm,
         metric_key=metric_key,
     )
+    direction = _metric_direction(metric_key)
+    oriented_deltas = [float(direction) * delta for delta in deltas]
     return {
         "pairs": len(deltas),
+        "metric_direction": direction,
+        "alternative": "target_better_than_baseline",
         "mean_delta": _mean(deltas),
+        "mean_improvement": _mean(oriented_deltas),
         "delta_ci95": _bootstrap_ci_mean(
             deltas,
             samples=bootstrap_samples,
             seed=seed + 17,
         ),
+        "improvement_ci95": _bootstrap_ci_mean(
+            oriented_deltas,
+            samples=bootstrap_samples,
+            seed=seed + 23,
+        ),
         "sign_flip_pvalues": _sign_flip_pvalues(
-            deltas,
+            oriented_deltas,
             samples=permutation_samples,
             seed=seed + 29,
         ),
@@ -771,9 +975,30 @@ def _protocol_main_offline_v1(**kwargs: Any) -> dict[str, Any]:
         b = by_arm[baseline]
         return {
             "success_rate_delta": _to_float(t.get("success_rate")) - _to_float(b.get("success_rate")),
+            "feasibility_rate_delta": _to_float(t.get("feasibility_rate")) - _to_float(b.get("feasibility_rate")),
             "violation_rate_delta": _to_float(t.get("violation_rate")) - _to_float(b.get("violation_rate")),
+            "transient_violation_rate_delta": (
+                _to_float(t.get("transient_violation_rate")) - _to_float(b.get("transient_violation_rate"))
+            ),
+            "executed_violation_rate_delta": (
+                _to_float(t.get("executed_violation_rate")) - _to_float(b.get("executed_violation_rate"))
+            ),
+            "unrecovered_violation_rate_delta": (
+                _to_float(t.get("unrecovered_violation_rate"))
+                - _to_float(b.get("unrecovered_violation_rate"))
+            ),
+            "avg_constraint_satisfaction_rate_delta": (
+                _to_float(t.get("avg_constraint_satisfaction_rate"))
+                - _to_float(b.get("avg_constraint_satisfaction_rate"))
+            ),
             "avg_round_delta": _to_float(t.get("avg_round")) - _to_float(b.get("avg_round")),
             "avg_seller_reward_delta": _to_float(t.get("avg_seller_reward")) - _to_float(b.get("avg_seller_reward")),
+            "avg_global_score_delta": _to_float(t.get("avg_global_score")) - _to_float(b.get("avg_global_score")),
+            "avg_welfare_delta": _to_float(t.get("avg_welfare")) - _to_float(b.get("avg_welfare")),
+            "avg_cost_adjusted_welfare_delta": (
+                _to_float(t.get("avg_cost_adjusted_welfare"))
+                - _to_float(b.get("avg_cost_adjusted_welfare"))
+            ),
             "avg_latency_sec_delta": _to_float(t.get("avg_latency_sec")) - _to_float(b.get("avg_latency_sec")),
         }
 
@@ -783,9 +1008,18 @@ def _protocol_main_offline_v1(**kwargs: Any) -> dict[str, Any]:
     if "ocl_full" in by_arm and "single" in by_arm:
         metric_keys = (
             "success",
+            "feasibility",
             "has_violation",
+            "transient_has_violation",
+            "executed_has_violation",
+            "unrecovered_has_violation",
+            "constraint_satisfaction_rate",
             "round",
             "seller_reward",
+            "global_score",
+            "welfare",
+            "cost_adjusted_welfare",
+            "escalation_count",
             "latency_sec",
         )
         paired_statistics["ocl_vs_single"] = {
@@ -819,6 +1053,103 @@ def _protocol_main_offline_v1(**kwargs: Any) -> dict[str, Any]:
         },
         "paired_statistics": paired_statistics,
         "plan": plan,
+    }
+
+
+def build_main_result_artifact(main_payload: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Standardize main-result payload into one paper-facing table artifact.
+
+    Input:
+        main_payload:
+            ``offline_v1.main`` payload or compatible mapping.
+
+    Output:
+        Dict with ``available`` flag plus canonical comparison rows when the
+        payload contains both ``single`` and ``ocl_full`` arms.
+
+    中文翻译：将 main protocol payload 标准化为论文主结果表。"""
+    payload = dict(main_payload or {})
+    by_arm = payload.get("summary_by_arm")
+    paired_stats = payload.get("paired_statistics")
+    if not isinstance(by_arm, Mapping) or not isinstance(paired_stats, Mapping):
+        return {
+            "available": False,
+            "protocol": "offline_v1.main_result",
+            "reason": "Missing summary_by_arm or paired_statistics in main payload.",
+        }
+
+    baseline_arm = "single"
+    target_arm = "ocl_full"
+    if baseline_arm not in by_arm or target_arm not in by_arm:
+        return {
+            "available": False,
+            "protocol": "offline_v1.main_result",
+            "reason": "Main payload does not contain both single and ocl_full.",
+        }
+
+    pair_payload = paired_stats.get("ocl_vs_single")
+    if not isinstance(pair_payload, Mapping):
+        return {
+            "available": False,
+            "protocol": "offline_v1.main_result",
+            "reason": "Main payload does not contain paired ocl_vs_single statistics.",
+        }
+
+    metric_payloads = pair_payload.get("metrics")
+    if not isinstance(metric_payloads, Mapping):
+        return {
+            "available": False,
+            "protocol": "offline_v1.main_result",
+            "reason": "Paired statistics do not contain metric payloads.",
+        }
+
+    baseline_summary = dict(by_arm[baseline_arm])
+    target_summary = dict(by_arm[target_arm])
+    rows: list[dict[str, Any]] = []
+    for metric_key, spec in _MAIN_RESULT_METRIC_SPECS.items():
+        stats = metric_payloads.get(metric_key)
+        if not isinstance(stats, Mapping):
+            continue
+        summary_key = str(spec["summary_key"])
+        delta_ci95 = dict(stats.get("delta_ci95") or {})
+        improvement_ci95 = dict(stats.get("improvement_ci95") or {})
+        pvalues = dict(stats.get("sign_flip_pvalues") or {})
+        direction = _metric_direction(metric_key)
+        rows.append(
+            {
+                "metric_key": metric_key,
+                "metric_label": str(spec["label"]),
+                "summary_key": summary_key,
+                "higher_is_better": direction > 0,
+                "direction_sign": direction,
+                "single_value": baseline_summary.get(summary_key),
+                "ocl_full_value": target_summary.get(summary_key),
+                "delta_ocl_minus_single": stats.get("mean_delta"),
+                "delta_ci95_lower": delta_ci95.get("lower"),
+                "delta_ci95_upper": delta_ci95.get("upper"),
+                "improvement_ocl_vs_single": stats.get("mean_improvement"),
+                "improvement_ci95_lower": improvement_ci95.get("lower"),
+                "improvement_ci95_upper": improvement_ci95.get("upper"),
+                "pairs": stats.get("pairs"),
+                "p_one_sided": pvalues.get("p_one_sided"),
+                "p_two_sided": pvalues.get("p_two_sided"),
+                "pvalue_method": pvalues.get("method"),
+                "pvalue_samples": pvalues.get("samples"),
+                "alternative": stats.get("alternative"),
+            }
+        )
+
+    return {
+        "available": True,
+        "protocol": "offline_v1.main_result",
+        "baseline_arm": baseline_arm,
+        "target_arm": target_arm,
+        "pair_definition": pair_payload.get("pair_definition"),
+        "summary_by_arm": {
+            baseline_arm: baseline_summary,
+            target_arm: target_summary,
+        },
+        "rows": rows,
     }
 
 
@@ -857,9 +1188,18 @@ def _protocol_ablation_offline_v1(**kwargs: Any) -> dict[str, Any]:
         return {
             "episodes": episodes,
             "success_rate": mean(_to_float(r.get("success")) for r in rows),
+            "feasibility_rate": mean(_to_float(r.get("feasibility", r.get("success"))) for r in rows),
             "violation_rate": mean(_to_float(r.get("has_violation")) for r in rows),
+            "avg_constraint_satisfaction_rate": mean(
+                _to_float(r.get("constraint_satisfaction_rate")) for r in rows
+            ),
             "avg_round": mean(_to_float(r.get("round")) for r in rows),
             "avg_seller_reward": mean(_to_float(r.get("seller_reward")) for r in rows),
+            "avg_global_score": mean(_to_float(r.get("global_score")) for r in rows),
+            "avg_welfare": mean(_to_float(r.get("welfare")) for r in rows),
+            "avg_cost_adjusted_welfare": mean(
+                _to_float(r.get("cost_adjusted_welfare")) for r in rows
+            ),
             "avg_latency_sec": mean(_to_float(r.get("latency_sec")) for r in rows),
         }
 
@@ -906,6 +1246,9 @@ def _protocol_adversarial_offline_v1(**kwargs: Any) -> dict[str, Any]:
                 "episodes": len(rows),
                 "robust_success_rate": mean(_to_float(r.get("success")) for r in rows),
                 "adversarial_violation_rate": mean(_to_float(r.get("has_violation")) for r in rows),
+                "avg_constraint_satisfaction_rate": mean(
+                    _to_float(r.get("constraint_satisfaction_rate")) for r in rows
+                ),
             }
             for arm, rows in by_arm.items()
         },
@@ -941,6 +1284,10 @@ def _protocol_repeated_offline_v1(**kwargs: Any) -> dict[str, Any]:
                 "success_rate": mean(_to_float(r.get("success")) for r in rows),
                 "violation_rate": mean(_to_float(r.get("has_violation")) for r in rows),
                 "avg_seller_reward": mean(_to_float(r.get("seller_reward")) for r in rows),
+                "avg_welfare": mean(_to_float(r.get("welfare")) for r in rows),
+                "avg_cost_adjusted_welfare": mean(
+                    _to_float(r.get("cost_adjusted_welfare")) for r in rows
+                ),
             }
         )
 
@@ -975,11 +1322,13 @@ def _protocol_roi_offline_v1(**kwargs: Any) -> dict[str, Any]:
     for row in summaries:
         arm = str(row.get("arm"))
         avg_reward = _to_float(row.get("avg_seller_reward"))
+        avg_welfare = _to_float(row.get("avg_welfare"))
         success_rate = _to_float(row.get("success_rate"))
         violation_rate = _to_float(row.get("violation_rate"))
         avg_latency = _to_float(row.get("avg_latency_sec"))
 
         gmv_proxy = success_rate * max(0.0, avg_reward)
+        welfare_proxy = success_rate * max(0.0, avg_welfare)
         human_cost_proxy = (1.0 - success_rate) * max(0.0, avg_latency)
         risk_loss_proxy = violation_rate
         latency_cost_proxy = avg_latency
@@ -993,6 +1342,7 @@ def _protocol_roi_offline_v1(**kwargs: Any) -> dict[str, Any]:
         roi_by_arm[arm] = {
             "roi_proxy": roi_value,
             "gmv_proxy": gmv_proxy,
+            "welfare_proxy": welfare_proxy,
             "human_cost_proxy": human_cost_proxy,
             "risk_loss_proxy": risk_loss_proxy,
             "latency_cost_proxy": latency_cost_proxy,

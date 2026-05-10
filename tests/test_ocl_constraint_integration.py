@@ -97,17 +97,17 @@ class OCLConstraintIntegrationTests(unittest.TestCase):
 
 中文翻译：确保 hard constraints affect runner execution and audit outputs。"""
 
-    def test_budget_violation_triggers_replan_and_records_trace(self) -> None:
-        """Input: seller proposes price above buyer cap (130 > 120).
+    def test_seller_floor_violation_triggers_replan_and_records_trace(self) -> None:
+        """Input: seller proposes price below seller floor (80 < 90).
 
         Expected output:
         - escalation path triggers deterministic replan once
-        - replanned seller action is executed with bounded price
-        - trace includes seller-side constraint evaluation + budget violation
+        - replanned seller action is executed at seller floor
+        - trace includes seller-side constraint evaluation + floor violation
         - final_info/trace final status are still populated by runner flow
         
 
-        中文翻译：输入：seller proposes price above buyer cap (130 > 120)。"""
+        中文翻译：输入：seller proposes price below seller floor (80 < 90)。"""
         created_envs: list[_InspectEnv] = []
 
         def _make_env(env_id: str, **kwargs: Any) -> _InspectEnv:
@@ -119,6 +119,81 @@ class OCLConstraintIntegrationTests(unittest.TestCase):
         env_mod.make_env = _make_env
         try:
             trace, final_info = run_ocl_negotiation_episode(
+                env_id="Task1_basic_price_negotiation-v0",
+                buyer_agent=_ConstAgent("buyer", "offer $100"),
+                seller_agent=_ConstAgent("seller", "final offer $80"),
+                env_kwargs={
+                    "buyer_max_price": 120.0,
+                    "seller_min_price": 90.0,
+                    "max_rounds": 10,
+                },
+                reset_kwargs={
+                    "user_requirement": "demo",
+                    "product_info": {"name": "x", "price": 100},
+                    "user_profile": "demo",
+                },
+            )
+        finally:
+            env_mod.make_env = original_make_env
+
+        self.assertEqual(1, len(created_envs))
+        env = created_envs[0]
+        self.assertEqual("offer $100", env.last_buyer_action)
+        self.assertEqual("I can revise to $90.00.", env.last_seller_action)
+
+        self.assertEqual("agreed", final_info["status"])
+        self.assertEqual("agreed", trace.final_status)
+
+        evaluated_events = [
+            event
+            for event in trace.events
+            if event.event_type == AuditEventType.CONSTRAINT_EVALUATED
+            and event.actor_id == "seller"
+        ]
+        self.assertGreater(len(evaluated_events), 0)
+        violations = {
+            check.violation_type.value
+            for event in evaluated_events
+            for check in event.constraint_checks
+            if check.violation_type is not None
+        }
+        self.assertIn(ViolationType.SELLER_FLOOR_BREACH.value, violations)
+
+        escalation_events = [
+            event
+            for event in trace.events
+            if event.event_type == AuditEventType.ESCALATION_TRIGGERED
+            and event.actor_id == "seller"
+        ]
+        self.assertGreater(len(escalation_events), 0)
+        replan_events = [
+            event
+            for event in trace.events
+            if event.event_type == AuditEventType.REPLAN_APPLIED
+            and event.actor_id == "seller"
+        ]
+        self.assertGreater(len(replan_events), 0)
+
+    def test_buyer_cap_is_not_used_by_seller_side_ocl(self) -> None:
+        """Input: seller proposes above buyer cap but above seller floor.
+
+        Expected output:
+        - seller action is not clamped to buyer max
+        - budget-cap violation is not emitted by seller-side OCL runner
+        - no deterministic replan occurs from buyer-private information
+
+        中文翻译：输入：seller proposes above buyer cap but above seller floor。"""
+        created_envs: list[_InspectEnv] = []
+
+        def _make_env(env_id: str, **kwargs: Any) -> _InspectEnv:
+            env = _InspectEnv()
+            created_envs.append(env)
+            return env
+
+        original_make_env = env_mod.make_env
+        env_mod.make_env = _make_env
+        try:
+            trace, _final_info = run_ocl_negotiation_episode(
                 env_id="Task1_basic_price_negotiation-v0",
                 buyer_agent=_ConstAgent("buyer", "offer $100"),
                 seller_agent=_ConstAgent("seller", "final offer $130"),
@@ -138,11 +213,7 @@ class OCLConstraintIntegrationTests(unittest.TestCase):
 
         self.assertEqual(1, len(created_envs))
         env = created_envs[0]
-        self.assertEqual("offer $100", env.last_buyer_action)
-        self.assertEqual("I can revise to $120.00.", env.last_seller_action)
-
-        self.assertEqual("agreed", final_info["status"])
-        self.assertEqual("agreed", trace.final_status)
+        self.assertEqual("final offer $130", env.last_seller_action)
 
         evaluated_events = [
             event
@@ -150,7 +221,71 @@ class OCLConstraintIntegrationTests(unittest.TestCase):
             if event.event_type == AuditEventType.CONSTRAINT_EVALUATED
             and event.actor_id == "seller"
         ]
-        self.assertGreater(len(evaluated_events), 0)
+        violations = {
+            check.violation_type.value
+            for event in evaluated_events
+            for check in event.constraint_checks
+            if check.violation_type is not None
+        }
+        self.assertNotIn(ViolationType.BUDGET_EXCEEDED.value, violations)
+        self.assertNotIn(ViolationType.SELLER_FLOOR_BREACH.value, violations)
+
+        replan_events = [
+            event
+            for event in trace.events
+            if event.event_type == AuditEventType.REPLAN_APPLIED
+            and event.actor_id == "seller"
+        ]
+        self.assertEqual(0, len(replan_events))
+
+    def test_buyer_cap_is_used_by_trusted_ocl(self) -> None:
+        """Input: trusted OCL sees buyer cap and seller proposes above it.
+
+        Expected output:
+        - budget-cap violation is emitted
+        - deterministic replan clamps the action to buyer_max_price
+        - trusted OCL executes the replanned seller offer
+
+        中文翻译：输入：trusted OCL 可见 buyer cap 且 seller 报价超出 cap。"""
+        created_envs: list[_InspectEnv] = []
+
+        def _make_env(env_id: str, **kwargs: Any) -> _InspectEnv:
+            env = _InspectEnv()
+            created_envs.append(env)
+            return env
+
+        original_make_env = env_mod.make_env
+        env_mod.make_env = _make_env
+        try:
+            trace, _final_info = run_ocl_negotiation_episode(
+                env_id="Task1_basic_price_negotiation-v0",
+                buyer_agent=_ConstAgent("buyer", "offer $100"),
+                seller_agent=_ConstAgent("seller", "final offer $130"),
+                env_kwargs={
+                    "buyer_max_price": 120.0,
+                    "seller_min_price": 90.0,
+                    "max_rounds": 10,
+                },
+                reset_kwargs={
+                    "user_requirement": "demo",
+                    "product_info": {"name": "x", "price": 100},
+                    "user_profile": "demo",
+                },
+                control_information_scope="trusted_constraints",
+            )
+        finally:
+            env_mod.make_env = original_make_env
+
+        self.assertEqual(1, len(created_envs))
+        env = created_envs[0]
+        self.assertEqual("I can revise to $120.00.", env.last_seller_action)
+
+        evaluated_events = [
+            event
+            for event in trace.events
+            if event.event_type == AuditEventType.CONSTRAINT_EVALUATED
+            and event.actor_id == "seller"
+        ]
         violations = {
             check.violation_type.value
             for event in evaluated_events
@@ -158,14 +293,6 @@ class OCLConstraintIntegrationTests(unittest.TestCase):
             if check.violation_type is not None
         }
         self.assertIn(ViolationType.BUDGET_EXCEEDED.value, violations)
-
-        escalation_events = [
-            event
-            for event in trace.events
-            if event.event_type == AuditEventType.ESCALATION_TRIGGERED
-            and event.actor_id == "seller"
-        ]
-        self.assertGreater(len(escalation_events), 0)
         replan_events = [
             event
             for event in trace.events

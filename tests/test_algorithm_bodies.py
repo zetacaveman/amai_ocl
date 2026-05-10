@@ -11,7 +11,12 @@ from aimai_ocl.attribution_counterfactual import (
     fallback_policy as counterfactual_fallback_policy,
 )
 from aimai_ocl.controllers.coordinator import CoordinationPhase, StateMachineCoordinator
-from aimai_ocl.controllers.risk_gate import BarrierRiskGate
+from aimai_ocl.controllers.control_surface import tau_control_surface_from_tau
+from aimai_ocl.controllers.risk_gate import (
+    BarrierRiskGate,
+    TauControlledRiskGate,
+    barrier_config_from_tau,
+)
 from aimai_ocl.schemas.actions import ActionIntent, ActionRole, RawAction
 from aimai_ocl.schemas.constraints import ConstraintSeverity
 
@@ -121,6 +126,97 @@ class BarrierRiskGateTests(unittest.TestCase):
         self.assertIn(risk_check.severity, {ConstraintSeverity.WARNING, ConstraintSeverity.ERROR})
         self.assertFalse(exec_action.approved)
         self.assertTrue(exec_action.requires_escalation)
+
+    def test_barrier_config_from_tau_is_monotonic(self) -> None:
+        """Input: lenient vs strict tau values.
+
+        Expected output:
+        - stricter tau lowers thresholds
+        - stricter tau lowers epsilon_miss
+
+        中文翻译：输入：宽松与严格的 tau 值。"""
+        lenient = barrier_config_from_tau(0.1)
+        strict = barrier_config_from_tau(0.9)
+        self.assertLess(strict["rewrite_threshold"], lenient["rewrite_threshold"])
+        self.assertLess(strict["block_threshold"], lenient["block_threshold"])
+        self.assertLess(strict["epsilon_miss"], lenient["epsilon_miss"])
+
+    def test_barrier_from_tau_changes_decision_boundary(self) -> None:
+        """Input: same action under lenient and strict tau.
+
+        Expected output:
+        - stricter tau produces stronger intervention
+
+        中文翻译：输入：相同行动在宽松与严格 tau 下的比较。"""
+        raw = RawAction(
+            actor_id="seller",
+            actor_role=ActionRole.SELLER,
+            intent=ActionIntent.NEGOTIATE_PRICE,
+            utterance="I can do $130!",
+            proposed_price=130.0,
+        )
+        state = {"buyer_max_price": 120.0, "seller_min_price": 90.0}
+        lenient_gate = BarrierRiskGate.from_tau(gate_tau=0.1)
+        strict_gate = BarrierRiskGate.from_tau(gate_tau=0.9)
+        lenient_check = lenient_gate.evaluate(raw, state=state)
+        strict_check = strict_gate.evaluate(raw, state=state)
+        lenient_exec = lenient_gate.apply(raw, [lenient_check], state=state)
+        strict_exec = strict_gate.apply(raw, [strict_check], state=state)
+        self.assertTrue(lenient_exec.approved)
+        self.assertFalse(strict_exec.approved)
+
+
+class TauControlledRiskGateTests(unittest.TestCase):
+    """Coverage for tau-controlled control-surface semantics.
+
+中文翻译：tau-controlled control-surface semantics 的覆盖测试。"""
+
+    def test_tau_control_surface_is_monotonic(self) -> None:
+        """Input: lenient vs strict tau values.
+
+        Expected output:
+        - stricter tau lowers thresholds
+        - stricter tau raises soft priors for commitment/negotiation intents
+
+        中文翻译：输入：宽松与严格 tau 值。"""
+        lenient = tau_control_surface_from_tau(0.1)
+        strict = tau_control_surface_from_tau(0.9)
+        self.assertLess(strict.rewrite_threshold, lenient.rewrite_threshold)
+        self.assertLess(strict.block_threshold, lenient.block_threshold)
+        self.assertLess(strict.epsilon_miss, lenient.epsilon_miss)
+        self.assertGreater(
+            strict.intent_risk_priors[ActionIntent.ACCEPT_DEAL],
+            lenient.intent_risk_priors[ActionIntent.ACCEPT_DEAL],
+        )
+        self.assertGreater(
+            strict.intent_risk_priors[ActionIntent.NEGOTIATE_PRICE],
+            lenient.intent_risk_priors[ActionIntent.NEGOTIATE_PRICE],
+        )
+
+    def test_tau_controlled_gate_changes_intervention_strength(self) -> None:
+        """Input: same commitment action under lenient and strict tau.
+
+        Expected output:
+        - low tau stays approved
+        - high tau produces stronger intervention
+
+        中文翻译：输入：相同 commitment action 在宽松与严格 tau 下的比较。"""
+        raw = RawAction(
+            actor_id="seller",
+            actor_role=ActionRole.SELLER,
+            intent=ActionIntent.ACCEPT_DEAL,
+            utterance="I promise a guaranteed refund and final confirmation now!",
+            proposed_price=110.0,
+        )
+        lenient_gate = TauControlledRiskGate.from_tau(gate_tau=0.1)
+        strict_gate = TauControlledRiskGate.from_tau(gate_tau=0.9)
+        lenient_check = lenient_gate.evaluate(raw)
+        strict_check = strict_gate.evaluate(raw)
+        lenient_exec = lenient_gate.apply(raw, [lenient_check])
+        strict_exec = strict_gate.apply(raw, [strict_check])
+        self.assertTrue(lenient_exec.approved)
+        self.assertIn(strict_exec.decision.value, {"rewrite", "block"})
+        self.assertNotEqual(lenient_exec.decision, strict_exec.decision)
 
 
 class CounterfactualAttributionTests(unittest.TestCase):

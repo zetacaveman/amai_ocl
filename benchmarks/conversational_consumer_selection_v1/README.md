@@ -83,6 +83,41 @@ cd benchmarks/conversational_consumer_selection_v1
 PYTHONPATH=src python -m conversational_consumer_selection.single_agent_demo --backend demo
 ```
 
+Run the V0 governance demo:
+
+```bash
+cd benchmarks/conversational_consumer_selection_v1
+PYTHONPATH=src python -m conversational_consumer_selection.v0_governance_demo \
+  --output-dir ../../outputs/conversational_consumer_selection_v1/v0_governance_demo
+```
+
+This demo is a mechanism vignette, not a full `single vs ocl_full` experiment.
+It compares raw structured actions with a thin governed wrapper that can
+rewrite unsafe `commit_selection` actions into `ask_clarification`,
+`recommend_option`, or `escalate`.
+
+Run the V0 LLM-backed governance demo:
+
+```bash
+cd benchmarks/conversational_consumer_selection_v1
+PYTHONPATH=src python -m conversational_consumer_selection.v0_llm_governance_demo \
+  --backend demo \
+  --output-dir ../../outputs/conversational_consumer_selection_v1/v0_llm_governance_demo
+```
+
+Use a real model only when you want API-backed behavior:
+
+```bash
+cd benchmarks/conversational_consumer_selection_v1
+PYTHONPATH=src python -m conversational_consumer_selection.v0_llm_governance_demo \
+  --backend openai \
+  --model gpt-5.4-mini \
+  --reasoning-effort none
+```
+
+For a deterministic unsafe-action smoke test, use
+`--backend commit_first_demo`.
+
 Run the dialogue demo with a model backend:
 
 ```bash
@@ -110,6 +145,12 @@ Add `--debug-actions` if you want to inspect the structured control actions.
   minimal platform agent
 - [`src/conversational_consumer_selection/single_agent_demo.py`](src/conversational_consumer_selection/single_agent_demo.py)
   `v0_structured` demo entry point
+- [`src/conversational_consumer_selection/governance.py`](src/conversational_consumer_selection/governance.py)
+  thin v0 governed-policy wrapper for action-governance demos
+- [`src/conversational_consumer_selection/v0_governance_demo.py`](src/conversational_consumer_selection/v0_governance_demo.py)
+  v0 structured governance vignette with trace/summary outputs
+- [`src/conversational_consumer_selection/v0_llm_governance_demo.py`](src/conversational_consumer_selection/v0_llm_governance_demo.py)
+  LLM-backed v0 governance vignette with raw-model and governed-action traces
 - [`src/conversational_consumer_selection/dialogue_demo.py`](src/conversational_consumer_selection/dialogue_demo.py)
   dialogue demo entry point
 

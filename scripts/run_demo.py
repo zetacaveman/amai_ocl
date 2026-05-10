@@ -13,6 +13,7 @@ import json
 import os
 import random
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +51,7 @@ from aimai_ocl import (
     run_ocl_negotiation_episode,
     run_single_negotiation_episode,
 )
+from aimai_ocl.evaluation_metrics import build_episode_metrics
 from aimai_ocl.model_runtime import (
     build_agenticpay_agents,
 )
@@ -111,6 +113,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--product-name", default=DEFAULT_RUN.product_name)
     parser.add_argument("--product-price", type=float, default=DEFAULT_RUN.product_price)
+    parser.add_argument(
+        "--gate-tau",
+        type=float,
+        default=DEFAULT_RUN.gate_tau,
+        help=(
+            "Gate control strength in [0,1]. Higher is stricter. "
+            "Currently applies to barrier-gate algorithms."
+        ),
+    )
     parser.add_argument(
         "--user-profile",
         default=DEFAULT_RUN.user_profile,
@@ -210,6 +221,8 @@ def _build_experiment_config(args: argparse.Namespace) -> ExperimentConfig:
     
 
     中文翻译：构建 an immutable experiment config from CLI args。"""
+    if not 0.0 <= float(args.gate_tau) <= 1.0:
+        raise ValueError("--gate-tau must be in [0, 1].")
     arm_name = _resolve_arm_name(args)
     arm_config = resolve_arm(arm_name)
     algorithm_bundle_id = args.algorithm_bundle or arm_config.algorithm_bundle_id
@@ -239,6 +252,7 @@ def _build_experiment_config(args: argparse.Namespace) -> ExperimentConfig:
         initial_seller_price=args.initial_seller_price,
         buyer_max_price=args.buyer_max_price,
         seller_min_price=args.seller_min_price,
+        gate_tau=args.gate_tau,
         user_requirement=args.user_requirement,
         product_name=args.product_name,
         product_price=args.product_price,
@@ -268,6 +282,7 @@ def _apply_seed(seed: int) -> None:
 def _build_result_record(
     experiment_config: ExperimentConfig,
     algorithm_bundle: Any,
+    episode_metrics: dict[str, Any],
     final_info: dict[str, Any],
     audit_events: int,
     episode_id: str,
@@ -300,6 +315,12 @@ def _build_result_record(
         "algorithm_bundle_id": arm.algorithm_bundle_id,
         "role_algorithm_id": algorithm_bundle.role_algorithm_id,
         "gate_algorithm_id": algorithm_bundle.gate_algorithm_id,
+        "gate_tau": algorithm_bundle.gate_runtime_config.get("gate_tau"),
+        "gate_family": algorithm_bundle.gate_runtime_config.get("gate_family"),
+        "gate_tau_applied": algorithm_bundle.gate_runtime_config.get("tau_applied"),
+        "rewrite_threshold": algorithm_bundle.gate_runtime_config.get("rewrite_threshold"),
+        "block_threshold": algorithm_bundle.gate_runtime_config.get("block_threshold"),
+        "epsilon_miss": algorithm_bundle.gate_runtime_config.get("epsilon_miss"),
         "escalation_algorithm_id": algorithm_bundle.escalation_algorithm_id,
         "audit_algorithm_id": algorithm_bundle.audit_algorithm_id,
         "attribution_algorithm_id": algorithm_bundle.attribution_algorithm_id,
@@ -313,14 +334,10 @@ def _build_result_record(
         "episode_id": episode_id,
         "status": final_info.get("status"),
         "agreed_price": final_info.get("agreed_price"),
-        "round": final_info.get("round"),
         "termination_reason": final_info.get("termination_reason"),
-        "buyer_reward": final_info.get("buyer_reward"),
-        "seller_reward": final_info.get("seller_reward"),
-        "global_score": final_info.get("global_score"),
-        "buyer_score": final_info.get("buyer_score"),
-        "seller_score": final_info.get("seller_score"),
         "audit_events": audit_events,
+        **episode_metrics,
+        "has_violation": int(episode_metrics["has_violation"]),
     }
     if trace_json_path is not None:
         result["trace_json"] = trace_json_path
@@ -416,6 +433,7 @@ def main() -> int:
             bundle_id=_base_algorithm_bundle.bundle_id,
             role_algorithm_id=experiment_config.arm.role_algorithm_id,
             gate_algorithm_id=experiment_config.arm.gate_algorithm_id,
+            gate_tau=experiment_config.run.gate_tau,
             escalation_algorithm_id=experiment_config.arm.escalation_algorithm_id,
             audit_algorithm_id=experiment_config.arm.audit_algorithm_id,
             attribution_algorithm_id=experiment_config.arm.attribution_algorithm_id,
@@ -456,10 +474,13 @@ def main() -> int:
         "trace_metadata": {
             "arm_name": experiment_config.arm.name,
             "runner_mode": experiment_config.arm.runner_mode,
+            "control_information_scope": experiment_config.arm.control_information_scope,
             "config_digest": experiment_config.digest(),
             "seed": experiment_config.run.seed,
+            "gate_runtime_config": algorithm_bundle.gate_runtime_config,
         },
     }
+    started = time.perf_counter()
     if experiment_config.arm.runner_mode == "ocl":
         trace, final_info = run_ocl_negotiation_episode(
             **common_kwargs,
@@ -467,12 +488,14 @@ def main() -> int:
             coordinator=algorithm_bundle.make_role_algorithm(),
             escalation_manager=algorithm_bundle.make_escalation_algorithm(),
             audit_policy=algorithm_bundle.make_audit_algorithm(),
+            control_information_scope=experiment_config.arm.control_information_scope,
         )
     else:
         trace, final_info = run_single_negotiation_episode(
             **common_kwargs,
             audit_policy=algorithm_bundle.make_audit_algorithm(),
         )
+    latency_sec = time.perf_counter() - started
     trace_json_path: str | None = None
     if args.trace_json:
         try:
@@ -481,9 +504,18 @@ def main() -> int:
             print(f"ERROR: failed to write trace JSON: {exc}", file=sys.stderr)
             return 2
 
+    episode_metrics = build_episode_metrics(
+        trace=trace,
+        final_info=final_info,
+        latency_sec=latency_sec,
+        actor_id="seller",
+        buyer_max_price=run_config.buyer_max_price,
+        seller_min_price=run_config.seller_min_price,
+    )
     result = _build_result_record(
         experiment_config=experiment_config,
         algorithm_bundle=algorithm_bundle,
+        episode_metrics=episode_metrics,
         final_info=final_info,
         audit_events=len(trace.events),
         episode_id=trace.episode_id,
@@ -495,6 +527,12 @@ def main() -> int:
         "algorithm_bundle_id",
         "role_algorithm_id",
         "gate_algorithm_id",
+        "gate_tau",
+        "gate_family",
+        "gate_tau_applied",
+        "rewrite_threshold",
+        "block_threshold",
+        "epsilon_miss",
         "escalation_algorithm_id",
         "audit_algorithm_id",
         "attribution_algorithm_id",
@@ -508,8 +546,29 @@ def main() -> int:
         "episode_id",
         "status",
         "agreed_price",
+        "success",
+        "env_success",
+        "strict_success",
+        "feasibility",
+        "price_feasible",
         "round",
         "termination_reason",
+        "seller_reward",
+        "global_score",
+        "welfare",
+        "latency_sec",
+        "constraint_satisfaction_rate",
+        "has_violation",
+        "transient_has_violation",
+        "executed_has_violation",
+        "recovered_has_violation",
+        "unrecovered_has_violation",
+        "failed_constraint_count",
+        "executed_failed_constraint_count",
+        "escalation_count",
+        "violation_type_counts",
+        "executed_violation_type_counts",
+        "cost_adjusted_welfare",
         "audit_events",
         "trace_json",
     ]

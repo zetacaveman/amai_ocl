@@ -34,6 +34,7 @@ class RunConfig:
     initial_seller_price: float = 180.0
     buyer_max_price: float = 120.0
     seller_min_price: float = 90.0
+    gate_tau: float = 0.5
 
     user_requirement: str = "I need a winter jacket"
     product_name: str = "Winter Jacket"
@@ -62,6 +63,8 @@ class ArmConfig:
         currently scaffold-level and will be fully activated in later steps.
         ``*_algorithm_id`` fields are optional component-level overrides that
         can specialize one bundle without creating a new bundle id.
+        ``control_information_scope`` defines which economic constraints are
+        visible to the OCL control path.
 
     中文翻译：
     ArmConfig 是实验臂契约。``role_on/gate_on/...`` 定义机制开关，
@@ -82,6 +85,7 @@ class ArmConfig:
     escalation_algorithm_id: str | None = None
     audit_algorithm_id: str | None = None
     attribution_algorithm_id: str | None = None
+    control_information_scope: str = "none"
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -131,6 +135,17 @@ ARM_REGISTRY: dict[str, ArmConfig] = {
         algorithm_bundle_id="v1_default",
         experiment_protocol_id="offline_v1",
     ),
+    "single_repair": ArmConfig(
+        name="single_repair",
+        runner_mode="single_repair",
+        role_on=False,
+        gate_on=False,
+        audit_on=True,
+        escalate_on=False,
+        attribution_on=False,
+        algorithm_bundle_id="v1_default",
+        experiment_protocol_id="offline_v1",
+    ),
     "ocl_full": ArmConfig(
         name="ocl_full",
         runner_mode="ocl",
@@ -141,6 +156,56 @@ ARM_REGISTRY: dict[str, ArmConfig] = {
         attribution_on=True,
         algorithm_bundle_id="v1_default",
         experiment_protocol_id="offline_v1",
+        control_information_scope="trusted_constraints",
+    ),
+    "trusted_ocl": ArmConfig(
+        name="trusted_ocl",
+        runner_mode="ocl",
+        role_on=True,
+        gate_on=True,
+        audit_on=True,
+        escalate_on=True,
+        attribution_on=True,
+        algorithm_bundle_id="v1_default",
+        experiment_protocol_id="offline_v1",
+        control_information_scope="trusted_constraints",
+    ),
+    "ocl_seller_side": ArmConfig(
+        name="ocl_seller_side",
+        runner_mode="ocl",
+        role_on=True,
+        gate_on=True,
+        audit_on=True,
+        escalate_on=True,
+        attribution_on=True,
+        algorithm_bundle_id="v1_default",
+        experiment_protocol_id="offline_v1",
+        control_information_scope="seller_side",
+    ),
+    "seller_ocl": ArmConfig(
+        name="seller_ocl",
+        runner_mode="ocl",
+        role_on=True,
+        gate_on=True,
+        audit_on=True,
+        escalate_on=True,
+        attribution_on=True,
+        algorithm_bundle_id="v1_default",
+        experiment_protocol_id="offline_v1",
+        control_information_scope="seller_side",
+    ),
+    "w_o_escalation": ArmConfig(
+        name="w_o_escalation",
+        runner_mode="ocl",
+        role_on=True,
+        gate_on=True,
+        audit_on=True,
+        escalate_on=False,
+        attribution_on=True,
+        algorithm_bundle_id="v1_default",
+        experiment_protocol_id="offline_v1",
+        escalation_algorithm_id="escalation_v0_off",
+        control_information_scope="trusted_constraints",
     ),
 }
 

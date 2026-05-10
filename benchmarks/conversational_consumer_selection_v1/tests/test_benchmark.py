@@ -24,6 +24,7 @@ from conversational_consumer_selection import (
     PromptBasedSingleAgent,
     RuleBasedUserSimulator,
     SelectionAction,
+    SelectionGovernedPolicy,
     SelectionTask,
     UserGoal,
     build_episode_record,
@@ -36,6 +37,10 @@ from conversational_consumer_selection import (
     render_history_transcript,
     run_benchmark,
     summarize_records,
+)
+from conversational_consumer_selection.v0_llm_governance_demo import (
+    CommitFirstDemoModel,
+    TraceableLLMPolicy,
 )
 
 
@@ -352,6 +357,57 @@ class BenchmarkEnvironmentTests(unittest.TestCase):
         self.assertTrue(info["has_transient_violation"])
         self.assertTrue(info["has_unrecovered_violation"])
         self.assertEqual("timeout", info["termination_reason"])
+
+
+class GovernanceWrapperTests(unittest.TestCase):
+    def test_wrapper_rewrites_early_commit_to_clarification(self) -> None:
+        class CommitFirstPolicy:
+            def act(self, observation):
+                del observation
+                return SelectionAction.commit_selection("offer_budget")
+
+        env = BestOfferSelectionEnv()
+        observation, _ = env.reset(task=make_v0_demo_task())
+        policy = SelectionGovernedPolicy(raw_policy=CommitFirstPolicy())
+
+        action = policy.act(observation)
+
+        self.assertEqual("ask_clarification", action.action_type.value)
+        self.assertEqual(CLARIFICATION_BUDGET_MAX, action.slot)
+        assert policy.last_decision is not None
+        self.assertEqual("rewrite", policy.last_decision.intervention)
+
+    def test_wrapper_escalates_unknown_selection_offer(self) -> None:
+        class UnknownOfferPolicy:
+            def act(self, observation):
+                del observation
+                return SelectionAction.commit_selection("missing_offer")
+
+        env = BestOfferSelectionEnv()
+        observation, _ = env.reset(task=make_default_task(level=BenchmarkLevel.DIRECT_INTENT))
+        policy = SelectionGovernedPolicy(raw_policy=UnknownOfferPolicy())
+
+        action = policy.act(observation)
+
+        self.assertEqual("escalate", action.action_type.value)
+        assert policy.last_decision is not None
+        self.assertEqual("escalate", policy.last_decision.intervention)
+
+    def test_raw_llm_demo_policy_allows_governance_to_rewrite_commit(self) -> None:
+        env = BestOfferSelectionEnv()
+        observation, _ = env.reset(task=make_v0_demo_task())
+        raw_policy = TraceableLLMPolicy(model=CommitFirstDemoModel())
+        policy = SelectionGovernedPolicy(raw_policy=raw_policy)
+
+        action = policy.act(observation)
+
+        self.assertEqual("ask_clarification", action.action_type.value)
+        self.assertEqual(CLARIFICATION_BUDGET_MAX, action.slot)
+        assert raw_policy.last_trace is not None
+        self.assertEqual("commit_selection", raw_policy.last_trace.action.action_type.value)
+        assert policy.last_decision is not None
+        self.assertEqual("rewrite", policy.last_decision.intervention)
+
 
 class MetricsTests(unittest.TestCase):
     def test_summarize_records_groups_by_arm_and_setting(self) -> None:

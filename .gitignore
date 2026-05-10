@@ -51,6 +51,13 @@ htmlcov/
 
 # Project-generated outputs
 outputs/
+paper/
+*.pdf
+*.pptx
+*.zip
+*.aux
+*.fdb_latexmk
+*.fls
 
 # External local checkouts
 agenticpay/
@@ -59,5 +66,4 @@ docs/
 # Private working markdowns stay local until paper release.
 *.md
 !/README.md
-!/readme_cn.md
 !/benchmarks/conversational_consumer_selection_v1/README.md

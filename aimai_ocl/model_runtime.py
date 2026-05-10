@@ -16,6 +16,8 @@ No provider routing or dynamic class loading is used.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import math
 import os
 from typing import Any
 
@@ -45,6 +47,280 @@ class ModelRuntimeConfig:
     api_key_env: str = OPENAI_API_KEY_ENV
 
 
+def _sanitize_text_payload(value: Any) -> str:
+    """Convert arbitrary text-like input into a JSON-safe UTF-8 string.
+
+    中文翻译：
+    把任意文本输入清洗成可安全写入 JSON 请求体的 UTF-8 字符串，去掉空字节、
+    非法代理项和不必要的控制字符。
+    """
+    text = value if isinstance(value, str) else str(value)
+    text = text.replace("\x00", "")
+    text = "".join(
+        character
+        if character in "\n\r\t" or ord(character) >= 0x20
+        else " "
+        for character in text
+    )
+    return text.encode("utf-8", errors="replace").decode("utf-8")
+
+
+def _sanitize_json_value(value: Any) -> Any:
+    """Recursively sanitize JSON-bound request values.
+
+    中文翻译：
+    递归清洗请求字段；字符串做 UTF-8 安全化，非有限浮点数直接丢弃。
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return _sanitize_text_payload(value)
+    if isinstance(value, bool | int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        return float(value)
+    if isinstance(value, list | tuple):
+        sanitized_items = []
+        for item in value:
+            sanitized_item = _sanitize_json_value(item)
+            if sanitized_item is not None:
+                sanitized_items.append(sanitized_item)
+        return sanitized_items
+    if isinstance(value, dict):
+        sanitized_dict: dict[str, Any] = {}
+        for key, item in value.items():
+            sanitized_item = _sanitize_json_value(item)
+            if sanitized_item is not None:
+                sanitized_dict[str(key)] = sanitized_item
+        return sanitized_dict
+    return _sanitize_text_payload(value)
+
+
+def _is_json_safe(value: Any) -> bool:
+    """Return whether a value can be serialized as strict JSON.
+
+    中文翻译：
+    检查值是否可被严格 JSON 序列化，避免把 NaN/对象之类直接送进请求体。
+    """
+    try:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _prefers_max_completion_tokens(model: str) -> bool:
+    """Return whether a model expects ``max_completion_tokens``.
+
+    中文翻译：判断模型是否更适合使用新版 max_completion_tokens 参数。
+    """
+    normalized = model.lower()
+    return normalized.startswith(("gpt-5", "o1", "o3", "o4"))
+
+
+class OpenAIChatLLM:
+    """Minimal OpenAI chat-completions adapter used by this project.
+
+    中文翻译：
+    项目内部最小 OpenAI 文本模型封装。只保留 chat-completions 路径，并在发送
+    前对请求体做 JSON 安全清洗。
+    """
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        api_key: str,
+        base_url: str | None = None,
+    ) -> None:
+        try:
+            import openai  # noqa: PLC0415
+        except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
+            raise _missing_dependency_error(exc) from exc
+        self.model = model
+        self.api_key = api_key
+        self.base_url = base_url
+        self.client = openai.OpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+        )
+
+    def _build_request(
+        self,
+        *,
+        prompt: str,
+        temperature: float | None,
+        max_tokens: int | None,
+        kwargs: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[str]]:
+        """Build a sanitized OpenAI request payload.
+
+        中文翻译：
+        生成清洗后的请求体，并返回被丢弃的字段名用于调试。
+        """
+        request: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": _sanitize_text_payload(prompt),
+                },
+            ],
+        }
+        dropped_fields: list[str] = []
+
+        if temperature is not None:
+            temperature_value = float(temperature)
+            if math.isfinite(temperature_value):
+                request["temperature"] = temperature_value
+            else:
+                dropped_fields.append("temperature")
+        if max_tokens is not None:
+            token_key = (
+                "max_completion_tokens"
+                if _prefers_max_completion_tokens(self.model)
+                else "max_tokens"
+            )
+            request[token_key] = int(max_tokens)
+
+        for key, value in kwargs.items():
+            sanitized_value = _sanitize_json_value(value)
+            if sanitized_value is None:
+                dropped_fields.append(key)
+                continue
+            if not _is_json_safe(sanitized_value):
+                dropped_fields.append(key)
+                continue
+            request[key] = sanitized_value
+        return request, dropped_fields
+
+    def generate(
+        self,
+        prompt: str,
+        temperature: float = 0.7,
+        max_tokens: int | None = None,
+        **kwargs: Any,
+    ) -> str:
+        """Generate text via OpenAI with a sanitized request payload.
+
+        中文翻译：
+        走 OpenAI chat-completions，并在请求体疑似损坏时自动做一次最小重试。
+        """
+        request, dropped_fields = self._build_request(
+            prompt=prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            kwargs=kwargs,
+        )
+        prompt_chars = len(request["messages"][0]["content"])
+        try:
+            response = self.client.chat.completions.create(**request)
+        except Exception as exc:
+            error_text = str(exc)
+            if (
+                "Unsupported parameter" in error_text
+                and "'max_tokens'" in error_text
+                and "max_tokens" in request
+            ):
+                retry_request = dict(request)
+                retry_request["max_completion_tokens"] = retry_request.pop("max_tokens")
+                try:
+                    response = self.client.chat.completions.create(**retry_request)
+                except Exception as retry_exc:
+                    raise RuntimeError(
+                        "OpenAI API error: "
+                        f"{retry_exc} [prompt_chars={prompt_chars}, "
+                        f"dropped_fields={dropped_fields}]"
+                    ) from retry_exc
+            elif (
+                "Unsupported parameter" in error_text
+                and "'max_completion_tokens'" in error_text
+                and "max_completion_tokens" in request
+            ):
+                retry_request = dict(request)
+                retry_request["max_tokens"] = retry_request.pop("max_completion_tokens")
+                try:
+                    response = self.client.chat.completions.create(**retry_request)
+                except Exception as retry_exc:
+                    raise RuntimeError(
+                        "OpenAI API error: "
+                        f"{retry_exc} [prompt_chars={prompt_chars}, "
+                        f"dropped_fields={dropped_fields}]"
+                    ) from retry_exc
+            elif (
+                (
+                    "Unsupported parameter" in error_text
+                    or "Unsupported value" in error_text
+                )
+                and "temperature" in error_text
+                and "temperature" in request
+            ):
+                retry_request = dict(request)
+                retry_request.pop("temperature", None)
+                try:
+                    response = self.client.chat.completions.create(**retry_request)
+                except Exception as retry_exc:
+                    raise RuntimeError(
+                        "OpenAI API error: "
+                        f"{retry_exc} [prompt_chars={prompt_chars}, "
+                        f"dropped_fields={dropped_fields + ['temperature']}]"
+                    ) from retry_exc
+            elif "parse the JSON body" in error_text:
+                fallback_request = {
+                    "model": self.model,
+                    "messages": request["messages"],
+                }
+                if "max_tokens" in request:
+                    fallback_request["max_tokens"] = request["max_tokens"]
+                if "max_completion_tokens" in request:
+                    fallback_request["max_completion_tokens"] = request[
+                        "max_completion_tokens"
+                    ]
+                try:
+                    response = self.client.chat.completions.create(**fallback_request)
+                except Exception as retry_exc:
+                    raise RuntimeError(
+                        "OpenAI API error: "
+                        f"{retry_exc} [prompt_chars={prompt_chars}, "
+                        f"dropped_fields={dropped_fields}]"
+                    ) from retry_exc
+            else:
+                raise RuntimeError(
+                    "OpenAI API error: "
+                    f"{exc} [prompt_chars={prompt_chars}, "
+                    f"dropped_fields={dropped_fields}]"
+                ) from exc
+        content = response.choices[0].message.content
+        return (content or "").strip()
+
+    def __repr__(self) -> str:
+        """Return string representation of the runtime model."""
+        return f"OpenAIChatLLM(model={self.model})"
+
+
+def _missing_dependency_error(exc: ModuleNotFoundError) -> RuntimeError:
+    """Build a precise runtime dependency error from an import failure.
+
+    中文翻译：
+    把底层 ModuleNotFoundError 转成更明确的安装提示，避免所有情况都误报为
+    “缺少 AgenticPay”。
+    """
+    missing_name = exc.name or str(exc)
+    if missing_name == "agenticpay":
+        install_hint = (
+            'pip install "git+https://github.com/SafeRL-Lab/AgenticPay.git" '
+            "&& pip install -e ."
+        )
+    else:
+        install_hint = f"pip install {missing_name}"
+    return RuntimeError(
+        "missing dependency: "
+        f"{exc}. Install with: {install_hint}"
+    )
+
+
 def resolve_model_runtime_config(run_config: RunConfig) -> ModelRuntimeConfig:
     """Resolve runtime config from run-level settings.
 
@@ -62,37 +338,27 @@ def resolve_model_runtime_config(run_config: RunConfig) -> ModelRuntimeConfig:
 
 
 def build_model_client(runtime_config: ModelRuntimeConfig) -> Any:
-    """Instantiate AgenticPay ``OpenAILLM`` for current run.
+    """Instantiate the project's OpenAI text client for current run.
 
     Input:
         runtime_config:
             Resolved runtime config containing model id and key env name.
 
     Output:
-        One instantiated `OpenAILLM` client.
+        One instantiated OpenAI text client.
 
     Raises:
         RuntimeError:
-            If AgenticPay `OpenAILLM` is unavailable or API key is missing.
+            If OpenAI client dependency is unavailable or API key is missing.
 
     中文翻译：
-    按固定构造参数创建 OpenAILLM；如果依赖缺失或密钥未配置，立即失败并给出
-    明确安装提示。
+    按固定构造参数创建项目内的 OpenAI 文本客户端；如果依赖缺失或密钥未配置，
+    立即失败并给出明确安装提示。
     """
-    try:
-        from agenticpay.models.openai_llm import OpenAILLM  # noqa: PLC0415
-    except ModuleNotFoundError as exc:  # pragma: no cover - runtime dependency guard
-        raise RuntimeError(
-            "missing dependency: "
-            f"{exc}. Install with: "
-            "pip install \"git+https://github.com/SafeRL-Lab/AgenticPay.git\" "
-            "&& pip install -e ."
-        ) from exc
-
     api_key = os.getenv(runtime_config.api_key_env)
     if not api_key:
         raise RuntimeError(f"{runtime_config.api_key_env} is not set.")
-    return OpenAILLM(model=runtime_config.model, api_key=api_key)
+    return OpenAIChatLLM(model=runtime_config.model, api_key=api_key)
 
 
 def build_agenticpay_agents(
@@ -120,12 +386,7 @@ def build_agenticpay_agents(
         from agenticpay.agents.buyer_agent import BuyerAgent  # noqa: PLC0415
         from agenticpay.agents.seller_agent import SellerAgent  # noqa: PLC0415
     except ModuleNotFoundError as exc:  # pragma: no cover - runtime dependency guard
-        raise RuntimeError(
-            "missing dependency: "
-            f"{exc}. Install with: "
-            "pip install \"git+https://github.com/SafeRL-Lab/AgenticPay.git\" "
-            "&& pip install -e ."
-        ) from exc
+        raise _missing_dependency_error(exc) from exc
 
     runtime_config = resolve_model_runtime_config(run_config)
     buyer_model = build_model_client(runtime_config)

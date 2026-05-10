@@ -96,8 +96,8 @@ class OCLController:
             history:
                 Optional dialogue history visible to controllers.
             state:
-                Optional control state, including runtime bounds like
-                ``buyer_max_price`` and ``seller_min_price``.
+                Optional control state, including seller-side runtime constraints
+                such as ``seller_min_price`` when available.
 
         Output:
             ``OCLControlResult`` with:

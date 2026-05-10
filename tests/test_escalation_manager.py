@@ -6,7 +6,10 @@ from __future__ import annotations
 
 import unittest
 
-from aimai_ocl.controllers.escalation_manager import EscalationManager
+from aimai_ocl.controllers.escalation_manager import (
+    DisabledEscalationManager,
+    EscalationManager,
+)
 from aimai_ocl.schemas.actions import ActionIntent, ActionRole, RawAction
 from aimai_ocl.schemas.audit import AuditEventType
 from aimai_ocl.schemas.constraints import ViolationType
@@ -113,6 +116,32 @@ class EscalationManagerTests(unittest.TestCase):
             "human_handoff",
             outcome.audit_events[0].metadata.get("strategy"),
         )
+
+    def test_disabled_escalation_manager_drops_non_direct_paths(self) -> None:
+        """Input: action requiring confirmation or escalation under disabled policy.
+
+        Expected output:
+        - no final text
+        - no replan
+        - strategy marks disabled drop
+
+        中文翻译：输入：在关闭升级策略下需要确认或升级的动作。"""
+        manager = DisabledEscalationManager()
+        outcome = manager.resolve(
+            round_id=4,
+            actor_id="seller",
+            raw_action=self.raw,
+            approved=True,
+            requires_confirmation=True,
+            requires_escalation=False,
+            violations=[ViolationType.HIGH_RISK_ACTION.value],
+            state={"buyer_max_price": 120.0, "seller_min_price": 90.0},
+        )
+        self.assertEqual("disabled_drop", outcome.strategy)
+        self.assertIsNone(outcome.final_text)
+        self.assertIsNone(outcome.replan_text)
+        self.assertFalse(outcome.requires_human_handoff)
+        self.assertEqual([], outcome.audit_events)
 
 
 if __name__ == "__main__":

@@ -205,6 +205,7 @@ def run_ocl_negotiation_episode(
     coordinator: Coordinator | None = None,
     escalation_manager: EscalationManager | None = None,
     audit_policy: AuditPolicy | None = None,
+    control_information_scope: str = "seller_side",
 ) -> tuple[EpisodeTrace, dict[str, Any]]:
     """Run one negotiation episode with seller-side OCL control decisions.
 
@@ -222,6 +223,9 @@ def run_ocl_negotiation_episode(
         controller: Optional prebuilt OCL controller.
         coordinator: Optional prebuilt round coordinator for role assignment.
         escalation_manager: Optional escalation/replan policy manager.
+        control_information_scope: Information boundary for OCL control:
+            ``seller_side`` exposes seller policy only; ``trusted_constraints``
+            also exposes buyer-disclosed constraint fields.
 
     Returns:
         A tuple ``(trace, final_info)`` where ``trace`` is the full audit trace
@@ -253,15 +257,29 @@ def run_ocl_negotiation_episode(
     ocl_controller = controller or OCLController()
     ocl_coordinator = coordinator or Coordinator()
     ocl_escalation = escalation_manager or EscalationManager()
+    normalized_scope = str(control_information_scope or "seller_side")
+    if normalized_scope not in {"seller_side", "trusted_constraints"}:
+        raise ValueError(
+            "control_information_scope must be one of "
+            "{'seller_side', 'trusted_constraints'}."
+        )
     done = False
     final_info: dict[str, Any] = {}
-    control_context = {
-        "buyer_max_price": env_config.get("buyer_max_price"),
+    seller_generation_context = {
+        # Seller-side OCL may use seller-private policy and observable state.
+        # Buyer reservation value remains environment/evaluation-only.
         "seller_min_price": env_config.get("seller_min_price"),
         "max_rounds": env_config.get("max_rounds"),
     }
+    control_context = dict(seller_generation_context)
+    if normalized_scope == "trusted_constraints":
+        # Trusted-OCL represents a mediator/platform that is explicitly
+        # authorized to hold buyer-disclosed machine-readable constraints.
+        control_context["buyer_max_price"] = env_config.get("buyer_max_price")
     product_info = normalized_reset_kwargs.get("product_info")
     if isinstance(product_info, dict):
+        seller_generation_context["product_name"] = product_info.get("name")
+        seller_generation_context["product_price"] = product_info.get("price")
         control_context["product_name"] = product_info.get("name")
         control_context["product_price"] = product_info.get("price")
 
@@ -291,7 +309,7 @@ def run_ocl_negotiation_episode(
             round_id=round_id,
             buyer_text=buyer_exec_text,
             seller_actor_id=seller_actor_id,
-            max_rounds=control_context.get("max_rounds"),
+            max_rounds=seller_generation_context.get("max_rounds"),
         )
         _trace_add_event(
             trace,
@@ -309,7 +327,7 @@ def run_ocl_negotiation_episode(
         seller_state.update(
             {
                 key: value
-                for key, value in control_context.items()
+                for key, value in seller_generation_context.items()
                 if value is not None
             }
         )
@@ -323,7 +341,15 @@ def run_ocl_negotiation_episode(
             conversation_history=seller_history,
             current_state=seller_state,
         )
-        control_state = dict(seller_state)
+        control_state = dict(observation)
+        control_state.update(
+            {
+                key: value
+                for key, value in control_context.items()
+                if value is not None
+            }
+        )
+        control_state["coordination_plan"] = coordination_plan_state
         seller_exec_text = _apply_control_to_text(
             trace=trace,
             controller=ocl_controller,

@@ -14,6 +14,7 @@ from conversational_consumer_selection.agents import (
     build_single_agent_context,
 )
 from conversational_consumer_selection.env import BestOfferSelectionEnv
+from conversational_consumer_selection.governance import GovernanceDecision, SelectionGovernedPolicy
 from conversational_consumer_selection.metrics import (
     build_episode_record,
     summarize_records,
@@ -75,6 +76,7 @@ __all__ = [
     "DialogueDecorator",
     "DialogueModel",
     "GreedySelectionPolicy",
+    "GovernanceDecision",
     "HistoryEntry",
     "LLMPlatformAgent",
     "LatentConsumerModel",
@@ -89,6 +91,7 @@ __all__ = [
     "RecommendationLabel",
     "RuleBasedUserSimulator",
     "SelectionAction",
+    "SelectionGovernedPolicy",
     "SingleAgentDecisionTrace",
     "SingleAgentModel",
     "SelectionTask",

@@ -49,10 +49,10 @@ from aimai_ocl import (
     run_single_negotiation_episode,
 )
 from aimai_ocl.evaluation_metrics import (
-    collect_violation_stats,
-    success_from_status,
+    build_episode_metrics,
     summarize_records,
 )
+from aimai_ocl.plugin_registry import build_main_result_artifact
 from aimai_ocl.model_runtime import (
     build_agenticpay_agents,
 )
@@ -79,8 +79,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--arms",
-        default="single,ocl_full",
-        help="Comma-separated arm list (default: single,ocl_full).",
+        default="single,trusted_ocl,seller_ocl,w_o_escalation",
+        help=(
+            "Comma-separated arm list "
+            "(default: single,trusted_ocl,seller_ocl,w_o_escalation)."
+        ),
     )
     parser.add_argument(
         "--episodes-per-arm",
@@ -137,6 +140,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--buyer-max-price", type=float, default=DEFAULT_RUN.buyer_max_price)
     parser.add_argument("--seller-min-price", type=float, default=DEFAULT_RUN.seller_min_price)
+    parser.add_argument(
+        "--gate-tau",
+        type=float,
+        default=DEFAULT_RUN.gate_tau,
+        help=(
+            "Gate control strength in [0,1]. Higher is stricter. "
+            "Currently applies to barrier-gate algorithms."
+        ),
+    )
     parser.add_argument("--user-requirement", default=DEFAULT_RUN.user_requirement)
     parser.add_argument("--product-name", default=DEFAULT_RUN.product_name)
     parser.add_argument("--product-price", type=float, default=DEFAULT_RUN.product_price)
@@ -217,6 +229,8 @@ def _build_base_run_config(args: argparse.Namespace) -> RunConfig:
     
 
     中文翻译：构建 run-level config shared by all arms in this batch。"""
+    if not 0.0 <= float(args.gate_tau) <= 1.0:
+        raise ValueError("--gate-tau must be in [0, 1].")
     return RunConfig(
         env_id=args.env_id,
         model=args.model,
@@ -225,6 +239,7 @@ def _build_base_run_config(args: argparse.Namespace) -> RunConfig:
         initial_seller_price=args.initial_seller_price,
         buyer_max_price=args.buyer_max_price,
         seller_min_price=args.seller_min_price,
+        gate_tau=args.gate_tau,
         user_requirement=args.user_requirement,
         product_name=args.product_name,
         product_price=args.product_price,
@@ -318,6 +333,31 @@ def _write_csv(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> Non
         writer.writeheader()
         for row in rows:
             writer.writerow({key: row.get(key) for key in fields})
+
+
+def _collect_single_repair_stats(trace: Any) -> dict[str, int]:
+    """Collect repair metadata emitted by the single_repair baseline."""
+    repair_events = []
+    for event in getattr(trace, "events", []):
+        exec_action = getattr(event, "executable_action", None)
+        metadata = getattr(exec_action, "metadata", {}) if exec_action is not None else {}
+        if metadata.get("repair_mode") == "single_repair":
+            repair_events.append(metadata)
+
+    repair_count = sum(1 for metadata in repair_events if metadata.get("repair_applied"))
+    raw_violation_count = sum(
+        1 for metadata in repair_events if metadata.get("raw_price_violation")
+    )
+    post_repair_violation_count = sum(
+        1 for metadata in repair_events if metadata.get("post_repair_violation")
+    )
+    return {
+        "seller_repair_event_count": len(repair_events),
+        "seller_repair_count": repair_count,
+        "seller_repair_applied": int(repair_count > 0),
+        "seller_raw_price_violation_count": raw_violation_count,
+        "seller_post_repair_violation_count": post_repair_violation_count,
+    }
 
 
 def _build_agents(
@@ -414,6 +454,7 @@ def _run_one(
         bundle_id=base_bundle.bundle_id,
         role_algorithm_id=arm.role_algorithm_id,
         gate_algorithm_id=arm.gate_algorithm_id,
+        gate_tau=run_config.gate_tau,
         escalation_algorithm_id=arm.escalation_algorithm_id,
         audit_algorithm_id=arm.audit_algorithm_id,
         attribution_algorithm_id=arm.attribution_algorithm_id,
@@ -427,6 +468,7 @@ def _run_one(
         initial_seller_price=run_config.initial_seller_price,
         buyer_max_price=run_config.buyer_max_price,
         seller_min_price=run_config.seller_min_price,
+        gate_tau=run_config.gate_tau,
         user_requirement=run_config.user_requirement,
         product_name=run_config.product_name,
         product_price=run_config.product_price,
@@ -461,10 +503,12 @@ def _run_one(
         "trace_metadata": {
             "arm_name": arm.name,
             "runner_mode": arm.runner_mode,
+            "control_information_scope": arm.control_information_scope,
             "config_digest": exp.digest(),
             "seed": seeded_run.seed,
             "episode_index": episode_index,
             "batch_mode": True,
+            "gate_runtime_config": algorithm_bundle.gate_runtime_config,
         },
     }
     if arm.runner_mode == "ocl":
@@ -474,6 +518,13 @@ def _run_one(
             coordinator=algorithm_bundle.make_role_algorithm(),
             escalation_manager=algorithm_bundle.make_escalation_algorithm(),
             audit_policy=algorithm_bundle.make_audit_algorithm(),
+            control_information_scope=arm.control_information_scope,
+        )
+    elif arm.runner_mode == "single_repair":
+        trace, final_info = run_single_negotiation_episode(
+            **common_kwargs,
+            audit_policy=algorithm_bundle.make_audit_algorithm(),
+            repair_seller_price=True,
         )
     else:
         trace, final_info = run_single_negotiation_episode(
@@ -482,7 +533,15 @@ def _run_one(
         )
     latency_sec = time.perf_counter() - start
 
-    violation = collect_violation_stats(trace, actor_id="seller")
+    episode_metrics = build_episode_metrics(
+        trace=trace,
+        final_info=final_info,
+        latency_sec=latency_sec,
+        actor_id="seller",
+        buyer_max_price=seeded_run.buyer_max_price,
+        seller_min_price=seeded_run.seller_min_price,
+    )
+    repair_stats = _collect_single_repair_stats(trace)
     trace_path: str | None = None
     if traces_dir is not None:
         trace_file = traces_dir / f"{arm.name}_ep{episode_index:03d}_seed{seed}_{trace.episode_id}.json"
@@ -492,9 +551,16 @@ def _run_one(
     record = {
         "arm": arm.name,
         "runner_mode": arm.runner_mode,
+        "control_information_scope": arm.control_information_scope,
         "algorithm_bundle_id": arm.algorithm_bundle_id,
         "role_algorithm_id": algorithm_bundle.role_algorithm_id,
         "gate_algorithm_id": algorithm_bundle.gate_algorithm_id,
+        "gate_tau": algorithm_bundle.gate_runtime_config.get("gate_tau"),
+        "gate_family": algorithm_bundle.gate_runtime_config.get("gate_family"),
+        "gate_tau_applied": algorithm_bundle.gate_runtime_config.get("tau_applied"),
+        "rewrite_threshold": algorithm_bundle.gate_runtime_config.get("rewrite_threshold"),
+        "block_threshold": algorithm_bundle.gate_runtime_config.get("block_threshold"),
+        "epsilon_miss": algorithm_bundle.gate_runtime_config.get("epsilon_miss"),
         "escalation_algorithm_id": algorithm_bundle.escalation_algorithm_id,
         "audit_algorithm_id": algorithm_bundle.audit_algorithm_id,
         "attribution_algorithm_id": algorithm_bundle.attribution_algorithm_id,
@@ -506,20 +572,16 @@ def _run_one(
         "config_digest": exp.digest(),
         "episode_id": trace.episode_id,
         "status": final_info.get("status"),
-        "success": success_from_status(final_info.get("status")),
-        "round": final_info.get("round"),
         "termination_reason": final_info.get("termination_reason"),
-        "seller_reward": final_info.get("seller_reward"),
-        "buyer_reward": final_info.get("buyer_reward"),
-        "global_score": final_info.get("global_score"),
-        "seller_score": final_info.get("seller_score"),
-        "buyer_score": final_info.get("buyer_score"),
-        "latency_sec": latency_sec,
+        "agreed_price": final_info.get("agreed_price"),
+        "buyer_price": final_info.get("buyer_price"),
+        "seller_price": final_info.get("seller_price"),
+        "buyer_max_price": seeded_run.buyer_max_price,
+        "seller_min_price": seeded_run.seller_min_price,
         "audit_events": len(trace.events),
-        "failed_constraint_count": violation["failed_constraint_count"],
-        "has_violation": int(violation["has_violation"]),
-        "escalation_count": violation["escalation_count"],
-        "violation_type_counts": violation["violation_type_counts"],
+        **repair_stats,
+        **episode_metrics,
+        "has_violation": int(episode_metrics["has_violation"]),
         "trace_json": trace_path,
     }
     return record
@@ -531,7 +593,8 @@ def main() -> int:
     Output:
         Returns process exit code and writes artifacts under output directory:
         ``runs.csv``, ``runs.json``, ``summary.csv``, ``summary.json``,
-        and ``protocol_outputs.json``.
+        ``protocol_outputs.json``, ``main_result.json``, and
+        ``main_result.csv`` when the canonical main comparison is available.
     
 
     中文翻译：batch evaluation 的入口函数。"""
@@ -568,6 +631,7 @@ def main() -> int:
                 bundle_id=args.algorithm_bundle or "v1_default",
                 role_algorithm_id=args.role_algorithm,
                 gate_algorithm_id=args.gate_algorithm,
+                gate_tau=args.gate_tau,
                 escalation_algorithm_id=args.escalation_algorithm,
                 audit_algorithm_id=args.audit_algorithm,
                 attribution_algorithm_id=args.attribution_algorithm,
@@ -588,6 +652,9 @@ def main() -> int:
 
     plan = {
         "arms": arms,
+        "resolved_arms": {
+            arm_name: resolve_arm(arm_name).to_dict() for arm_name in arms
+        },
         "episodes_per_arm": args.episodes_per_arm,
         "seed_base": args.seed_base,
         "output_dir": str(output_dir),
@@ -638,10 +705,12 @@ def main() -> int:
                 f"bundle={record['algorithm_bundle_id']} "
                 f"role_alg={record['role_algorithm_id']} "
                 f"gate_alg={record['gate_algorithm_id']} "
+                f"gate_tau={record['gate_tau']} "
                 f"esc_alg={record['escalation_algorithm_id']} "
                 f"audit_alg={record['audit_algorithm_id']} "
                 f"attr_alg={record['attribution_algorithm_id']} "
                 f"protocol={record['experiment_protocol_id']} "
+                f"scope={record['control_information_scope']} "
                 f"seller_reward={record['seller_reward']} "
                 f"latency_sec={record['latency_sec']:.3f}"
             )
@@ -703,12 +772,29 @@ def main() -> int:
         }
     elapsed = time.perf_counter() - started
 
+    main_result = {
+        "available": False,
+        "protocol": "offline_v1.main_result",
+        "reason": "No protocol emitted a canonical single-vs-ocl main result.",
+    }
+    for protocol_id in protocol_ids:
+        protocol_payload = protocol_outputs.get(protocol_id, {})
+        candidate = build_main_result_artifact(protocol_payload.get("main"))
+        if bool(candidate.get("available")):
+            main_result = {
+                **candidate,
+                "source_protocol_id": protocol_id,
+            }
+            break
+
     output_dir.mkdir(parents=True, exist_ok=True)
     runs_json = output_dir / "runs.json"
     runs_csv = output_dir / "runs.csv"
     summary_json = output_dir / "summary.json"
     summary_csv = output_dir / "summary.csv"
     protocol_json = output_dir / "protocol_outputs.json"
+    main_result_json = output_dir / "main_result.json"
+    main_result_csv = output_dir / "main_result.csv"
 
     runs_for_csv = []
     for row in records:
@@ -756,15 +842,30 @@ def main() -> int:
             "protocol_outputs": protocol_outputs,
         },
     )
+    _write_json(
+        main_result_json,
+        {
+            "plan": plan,
+            "total_runs": len(records),
+            "main_result": main_result,
+        },
+    )
     _write_csv(
         runs_csv,
         runs_for_csv,
         fields=[
             "arm",
             "runner_mode",
+            "control_information_scope",
             "algorithm_bundle_id",
             "role_algorithm_id",
             "gate_algorithm_id",
+            "gate_tau",
+            "gate_family",
+            "gate_tau_applied",
+            "rewrite_threshold",
+            "block_threshold",
+            "epsilon_miss",
             "escalation_algorithm_id",
             "audit_algorithm_id",
             "attribution_algorithm_id",
@@ -776,20 +877,45 @@ def main() -> int:
             "config_digest",
             "episode_id",
             "status",
+            "agreed_price",
+            "buyer_price",
+            "seller_price",
+            "buyer_max_price",
+            "seller_min_price",
             "success",
+            "env_success",
+            "strict_success",
+            "feasibility",
+            "price_feasible",
             "round",
             "termination_reason",
             "seller_reward",
             "buyer_reward",
             "global_score",
+            "welfare",
+            "cost_adjusted_welfare",
             "seller_score",
             "buyer_score",
             "latency_sec",
             "audit_events",
+            "seller_repair_event_count",
+            "seller_repair_count",
+            "seller_repair_applied",
+            "seller_raw_price_violation_count",
+            "seller_post_repair_violation_count",
+            "total_constraint_check_count",
+            "passed_constraint_count",
             "failed_constraint_count",
+            "executed_failed_constraint_count",
+            "constraint_satisfaction_rate",
             "has_violation",
+            "transient_has_violation",
+            "executed_has_violation",
+            "recovered_has_violation",
+            "unrecovered_has_violation",
             "escalation_count",
             "violation_type_counts",
+            "executed_violation_type_counts",
             "trace_json",
         ],
     )
@@ -800,14 +926,61 @@ def main() -> int:
             "arm",
             "episodes",
             "success_rate",
+            "strict_success_rate",
+            "feasibility_rate",
             "violation_rate",
+            "transient_violation_rate",
+            "executed_violation_rate",
+            "recovered_violation_rate",
+            "unrecovered_violation_rate",
+            "avg_constraint_satisfaction_rate",
             "avg_round",
             "avg_seller_reward",
             "avg_latency_sec",
+            "avg_global_score",
+            "avg_welfare",
+            "avg_cost_adjusted_welfare",
             "avg_audit_events",
+            "repair_rate",
+            "avg_seller_repair_count",
+            "raw_price_violation_rate",
+            "post_repair_violation_rate",
+            "total_seller_repairs",
+            "avg_total_constraint_checks",
+            "avg_passed_constraint_checks",
+            "avg_failed_constraint_count",
+            "avg_executed_failed_constraint_count",
+            "avg_escalation_count",
             "total_failed_constraints",
+            "total_executed_failed_constraints",
             "total_escalations",
             "violation_type_counts",
+            "executed_violation_type_counts",
+        ],
+    )
+    _write_csv(
+        main_result_csv,
+        list(main_result.get("rows") or []),
+        fields=[
+            "metric_key",
+            "metric_label",
+            "summary_key",
+            "higher_is_better",
+            "direction_sign",
+            "single_value",
+            "ocl_full_value",
+            "delta_ocl_minus_single",
+            "delta_ci95_lower",
+            "delta_ci95_upper",
+            "improvement_ocl_vs_single",
+            "improvement_ci95_lower",
+            "improvement_ci95_upper",
+            "pairs",
+            "p_one_sided",
+            "p_two_sided",
+            "pvalue_method",
+            "pvalue_samples",
+            "alternative",
         ],
     )
 
@@ -817,6 +990,8 @@ def main() -> int:
     print(f"summary_csv: {summary_csv}")
     print(f"summary_json: {summary_json}")
     print(f"protocol_json: {protocol_json}")
+    print(f"main_result_json: {main_result_json}")
+    print(f"main_result_csv: {main_result_csv}")
     print(f"total_runs: {len(records)}")
     print(f"elapsed_sec: {elapsed:.3f}")
     print(f"result_json: {json.dumps({'output_dir': str(output_dir), 'total_runs': len(records)}, ensure_ascii=True, sort_keys=True)}")

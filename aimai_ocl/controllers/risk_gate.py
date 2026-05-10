@@ -13,6 +13,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from aimai_ocl.controllers.control_surface import (
+    TauControlSurface,
+    tau_control_surface_from_tau,
+)
 from aimai_ocl.schemas.actions import (
     ActionIntent,
     ControlDecision,
@@ -20,6 +24,40 @@ from aimai_ocl.schemas.actions import (
     RawAction,
 )
 from aimai_ocl.schemas.constraints import ConstraintCheck, ConstraintSeverity, ViolationType
+
+
+def barrier_config_from_tau(gate_tau: float) -> dict[str, float]:
+    """Map paper-level control strength ``tau`` to barrier gate parameters.
+
+    Input:
+        gate_tau:
+            Enforcement-strength scalar in ``[0, 1]`` where larger means
+            stricter control.
+
+    Output:
+        Dict containing normalized ``gate_tau`` and the concrete barrier
+        parameters ``rewrite_threshold``, ``block_threshold``, and
+        ``epsilon_miss``.
+
+    Note:
+        The mapping is monotonic:
+        - larger ``gate_tau`` => lower thresholds => stricter gate
+        - smaller ``gate_tau`` => higher thresholds => more lenient gate
+
+    中文翻译：将论文中的 ``tau`` 映射为 barrier gate 的具体参数。"""
+    try:
+        tau = float(gate_tau)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("gate_tau must be a float in [0, 1].") from exc
+    if not 0.0 <= tau <= 1.0:
+        raise ValueError("gate_tau must be in [0, 1].")
+
+    return {
+        "gate_tau": tau,
+        "rewrite_threshold": 0.60 - (0.25 * tau),
+        "block_threshold": 0.85 - (0.25 * tau),
+        "epsilon_miss": 0.20 - (0.15 * tau),
+    }
 
 
 @dataclass(slots=True)
@@ -193,6 +231,27 @@ class BarrierRiskGate:
     block_threshold: float = 0.75
     epsilon_miss: float = 0.10
     require_confirmation_for_high_risk: bool = True
+
+    @classmethod
+    def from_tau(cls, *, gate_tau: float) -> BarrierRiskGate:
+        """Construct one barrier gate from paper-level control strength ``tau``.
+
+        Input:
+            gate_tau:
+                Enforcement-strength scalar in ``[0, 1]``. Higher values mean
+                stricter control.
+
+        Output:
+            ``BarrierRiskGate`` instance with thresholds derived from
+            ``barrier_config_from_tau``.
+
+        中文翻译：通过论文中的 ``tau`` 构造 barrier gate。"""
+        params = barrier_config_from_tau(gate_tau)
+        return cls(
+            rewrite_threshold=params["rewrite_threshold"],
+            block_threshold=params["block_threshold"],
+            epsilon_miss=params["epsilon_miss"],
+        )
 
     def evaluate(
         self,
@@ -465,6 +524,246 @@ class BarrierRiskGate:
 
         中文翻译：返回 simple monotonic upper-bound factor based on epsilon。"""
         eps = min(1.0, max(0.0, self.epsilon_miss))
+        return 1.0 - eps
+
+
+@dataclass(slots=True)
+class TauControlledRiskGate:
+    """Risk gate that consumes a structured ``tau``-derived control surface.
+
+    Compared with ``BarrierRiskGate``, this gate:
+    - keeps ``tau`` continuous
+    - separates hard price feasibility from soft governance
+    - treats fixed high-risk tool/escalation actions differently from ordinary
+      negotiation actions
+
+    中文翻译：消费结构化 ``tau`` 控制面的 risk gate。"""
+
+    control_surface: TauControlSurface
+    require_confirmation_for_fixed_high_risk: bool = True
+
+    @classmethod
+    def from_tau(cls, *, gate_tau: float) -> TauControlledRiskGate:
+        """Construct one tau-controlled gate from paper-level ``tau``.
+
+        中文翻译：通过论文中的 ``tau`` 构造 tau-controlled gate。"""
+        return cls(control_surface=tau_control_surface_from_tau(gate_tau))
+
+    def evaluate(
+        self,
+        raw_action: RawAction,
+        *,
+        state: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> ConstraintCheck:
+        risk_score = self._risk_score(
+            raw_action=raw_action,
+            state=state or {},
+            history=history or [],
+        )
+        severity = self._severity_from_score(risk_score)
+        passed = risk_score < self.control_surface.block_threshold
+        return ConstraintCheck(
+            constraint_id="risk_gate_tau_controlled",
+            passed=passed,
+            severity=severity,
+            reason=(
+                f"Tau-controlled risk score={risk_score:.3f} "
+                f"(rewrite@{self.control_surface.rewrite_threshold:.2f}, "
+                f"block@{self.control_surface.block_threshold:.2f})."
+            ),
+            violation_type=(
+                ViolationType.HIGH_RISK_ACTION
+                if (
+                    risk_score >= self.control_surface.rewrite_threshold
+                    or raw_action.intent in self.control_surface.fixed_high_risk_intents
+                )
+                else None
+            ),
+            checked_fields=["intent", "utterance", "proposed_price"],
+            metadata={
+                "risk_score": risk_score,
+                "rewrite_threshold": self.control_surface.rewrite_threshold,
+                "block_threshold": self.control_surface.block_threshold,
+                "epsilon_miss": self.control_surface.epsilon_miss,
+                "gate_tau": self.control_surface.gate_tau,
+                "gate_family": "tau_controlled",
+                "fixed_high_risk": raw_action.intent in self.control_surface.fixed_high_risk_intents,
+                "intent_risk_prior": self._intent_prior(raw_action.intent),
+                "violation_upper_bound_factor": self._violation_upper_bound_factor(),
+            },
+        )
+
+    def apply(
+        self,
+        raw_action: RawAction,
+        checks: list[ConstraintCheck],
+        *,
+        state: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> ExecutableAction:
+        del history
+        has_hard_failure = any(
+            (not check.passed)
+            and check.severity in {ConstraintSeverity.ERROR, ConstraintSeverity.CRITICAL}
+            and check.constraint_id != "risk_gate_tau_controlled"
+            for check in checks
+        )
+        if has_hard_failure:
+            return ExecutableAction(
+                actor_id=raw_action.actor_id,
+                actor_role=raw_action.actor_role,
+                approved=False,
+                decision=ControlDecision.BLOCK,
+                final_text="",
+                intent=raw_action.intent,
+                final_price=None,
+                blocked_reason="Blocked by failed hard checks before tau-controlled pass.",
+                requires_confirmation=False,
+                requires_escalation=True,
+                metadata={"gate_family": "tau_controlled", "gate_decision": "hard_block"},
+            )
+
+        risk_score = self._extract_risk_score_from_checks(checks)
+        if risk_score is None:
+            risk_score = self._risk_score(
+                raw_action=raw_action,
+                state=state or {},
+                history=[],
+            )
+
+        if raw_action.intent == ActionIntent.ESCALATE:
+            return ExecutableAction(
+                actor_id=raw_action.actor_id,
+                actor_role=raw_action.actor_role,
+                approved=True,
+                decision=ControlDecision.ESCALATE,
+                final_text=raw_action.utterance,
+                intent=raw_action.intent,
+                final_price=raw_action.proposed_price,
+                blocked_reason=None,
+                requires_confirmation=False,
+                requires_escalation=True,
+                metadata={
+                    "gate_family": "tau_controlled",
+                    "gate_score": risk_score,
+                    "gate_decision": "explicit_escalate",
+                },
+            )
+
+        if risk_score >= self.control_surface.block_threshold:
+            return ExecutableAction(
+                actor_id=raw_action.actor_id,
+                actor_role=raw_action.actor_role,
+                approved=False,
+                decision=ControlDecision.BLOCK,
+                final_text="",
+                intent=raw_action.intent,
+                final_price=None,
+                blocked_reason=(
+                    f"Blocked by tau-controlled score {risk_score:.3f} "
+                    f">= block threshold {self.control_surface.block_threshold:.2f}."
+                ),
+                requires_confirmation=False,
+                requires_escalation=True,
+                metadata={
+                    "gate_family": "tau_controlled",
+                    "gate_score": risk_score,
+                    "gate_decision": "score_block",
+                },
+            )
+
+        requires_confirmation = (
+            risk_score >= self.control_surface.rewrite_threshold
+            or (
+                self.require_confirmation_for_fixed_high_risk
+                and raw_action.intent in self.control_surface.fixed_high_risk_intents
+            )
+        )
+        decision = ControlDecision.REWRITE if requires_confirmation else ControlDecision.APPROVE
+        return ExecutableAction(
+            actor_id=raw_action.actor_id,
+            actor_role=raw_action.actor_role,
+            approved=True,
+            decision=decision,
+            final_text=raw_action.utterance,
+            intent=raw_action.intent,
+            final_price=raw_action.proposed_price,
+            blocked_reason=None,
+            requires_confirmation=requires_confirmation,
+            requires_escalation=False,
+            metadata={
+                "gate_family": "tau_controlled",
+                "gate_score": risk_score,
+                "gate_decision": decision.value,
+            },
+        )
+
+    def _risk_score(
+        self,
+        *,
+        raw_action: RawAction,
+        state: dict[str, Any],
+        history: list[dict[str, Any]],
+    ) -> float:
+        del state
+        score = 0.02 + self._intent_prior(raw_action.intent)
+
+        text = raw_action.utterance.lower()
+        if any(token in text for token in ("password", "card", "bank", "account", "ssn", "cvv")):
+            score += 0.45
+
+        commitment_markers = (
+            "promise",
+            "guarantee",
+            "guaranteed",
+            "refund",
+            "return",
+            "warranty",
+            "confirm",
+            "final",
+            "locked in",
+        )
+        marker_hits = sum(1 for marker in commitment_markers if marker in text)
+        if marker_hits:
+            score += min(0.28, 0.08 * marker_hits)
+
+        if raw_action.tool_intent:
+            score += 0.12
+        if raw_action.intent == ActionIntent.ACCEPT_DEAL and raw_action.proposed_price is not None:
+            score += 0.08
+        if "!" in raw_action.utterance:
+            score += 0.03
+        if len(history) >= 12:
+            score += 0.04
+
+        return min(1.0, max(0.0, score))
+
+    def _extract_risk_score_from_checks(
+        self,
+        checks: list[ConstraintCheck],
+    ) -> float | None:
+        for check in checks:
+            if check.constraint_id != "risk_gate_tau_controlled":
+                continue
+            value = check.metadata.get("risk_score")
+            parsed = _coerce_float(value)
+            if parsed is not None:
+                return min(1.0, max(0.0, parsed))
+        return None
+
+    def _severity_from_score(self, risk_score: float) -> ConstraintSeverity:
+        if risk_score >= self.control_surface.block_threshold:
+            return ConstraintSeverity.ERROR
+        if risk_score >= self.control_surface.rewrite_threshold:
+            return ConstraintSeverity.WARNING
+        return ConstraintSeverity.INFO
+
+    def _intent_prior(self, intent: ActionIntent) -> float:
+        return float(self.control_surface.intent_risk_priors.get(intent, 0.0))
+
+    def _violation_upper_bound_factor(self) -> float:
+        eps = min(1.0, max(0.0, self.control_surface.epsilon_miss))
         return 1.0 - eps
 
 

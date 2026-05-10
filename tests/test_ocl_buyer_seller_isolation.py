@@ -138,6 +138,11 @@ class BuyerSellerIsolationTests(unittest.TestCase):
                 env_id="Task1_basic_price_negotiation-v0",
                 buyer_agent=_DummyAgent("buyer"),
                 seller_agent=seller,
+                env_kwargs={
+                    "buyer_max_price": 120.0,
+                    "seller_min_price": 90.0,
+                    "max_rounds": 10,
+                },
                 reset_kwargs={
                     "user_requirement": "demo",
                     "product_info": {"name": "x", "price": 100},
@@ -183,6 +188,67 @@ class BuyerSellerIsolationTests(unittest.TestCase):
         assert seller.last_state is not None
         self.assertIn("coordination_plan", seller.last_state)
         self.assertIn("decision_role", seller.last_state["coordination_plan"])
+        self.assertIn("seller_min_price", seller.last_state)
+        self.assertNotIn("buyer_max_price", seller.last_state)
+        seller_raw_events = [
+            event
+            for event in trace.events
+            if event.actor_id == "seller"
+            and event.event_type == AuditEventType.RAW_ACTION_RECEIVED
+        ]
+        self.assertGreater(len(seller_raw_events), 0)
+        for event in seller_raw_events:
+            state_keys = set(event.metadata.get("state_keys", []))
+            self.assertIn("seller_min_price", state_keys)
+            self.assertNotIn("buyer_max_price", state_keys)
+
+    def test_trusted_ocl_scope_exposes_buyer_constraint_only_to_control_path(self) -> None:
+        """Input: one-round OCL episode with trusted-constraint scope.
+
+        Expected output:
+        - buyer is still pass-through
+        - seller generator state still hides buyer_max_price
+        - audit metadata records buyer_max_price as visible to OCL control
+
+        中文翻译：输入：trusted-constraint scope 的 one-round OCL episode。"""
+        seller = _RecordingSellerAgent("seller")
+        original_make_env = env_mod.make_env
+        env_mod.make_env = lambda env_id, **kwargs: _DummyEnv()
+        try:
+            trace, _info = run_ocl_negotiation_episode(
+                env_id="Task1_basic_price_negotiation-v0",
+                buyer_agent=_DummyAgent("buyer"),
+                seller_agent=seller,
+                env_kwargs={
+                    "buyer_max_price": 120.0,
+                    "seller_min_price": 90.0,
+                    "max_rounds": 10,
+                },
+                reset_kwargs={
+                    "user_requirement": "demo",
+                    "product_info": {"name": "x", "price": 100},
+                    "user_profile": "demo",
+                },
+                control_information_scope="trusted_constraints",
+            )
+        finally:
+            env_mod.make_env = original_make_env
+
+        self.assertIsNotNone(seller.last_state)
+        assert seller.last_state is not None
+        self.assertIn("seller_min_price", seller.last_state)
+        self.assertNotIn("buyer_max_price", seller.last_state)
+        seller_raw_events = [
+            event
+            for event in trace.events
+            if event.actor_id == "seller"
+            and event.event_type == AuditEventType.RAW_ACTION_RECEIVED
+        ]
+        self.assertGreater(len(seller_raw_events), 0)
+        for event in seller_raw_events:
+            state_keys = set(event.metadata.get("state_keys", []))
+            self.assertIn("seller_min_price", state_keys)
+            self.assertIn("buyer_max_price", state_keys)
 
 
 if __name__ == "__main__":

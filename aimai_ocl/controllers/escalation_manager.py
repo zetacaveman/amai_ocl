@@ -253,6 +253,59 @@ class EscalationManager:
         return replanned if replanned > 0 else None
 
 
+@dataclass(slots=True)
+class DisabledEscalationManager:
+    """Escalation policy ablation that removes repair and handoff behavior.
+
+    Input:
+        None. This manager intentionally does not emit replan or handoff.
+
+    Output:
+        - directly executable actions still pass through
+        - confirmation/block/escalation cases are dropped with no repair
+
+    中文翻译：用于消融的升级策略，移除重规划与人工升级行为。"""
+
+    def resolve(
+        self,
+        *,
+        round_id: int,
+        actor_id: str,
+        raw_action: RawAction,
+        approved: bool,
+        requires_confirmation: bool,
+        requires_escalation: bool,
+        violations: list[str],
+        state: dict[str, Any],
+        allow_replan: bool = True,
+    ) -> EscalationOutcome:
+        """Resolve one action with escalation disabled.
+
+        Input:
+            Same as ``EscalationManager.resolve(...)``.
+
+        Output:
+            - ``direct_execute`` only when action is already executable
+            - otherwise ``disabled_drop`` with no final text and no replan
+
+        中文翻译：在升级机制关闭时解析动作。"""
+        del round_id, actor_id, violations, state, allow_replan
+        if approved and (not requires_confirmation) and (not requires_escalation):
+            final_text = raw_action.utterance.strip() or None
+            return EscalationOutcome(
+                final_text=final_text,
+                replan_text=None,
+                requires_human_handoff=False,
+                strategy="direct_execute",
+            )
+        return EscalationOutcome(
+            final_text=None,
+            replan_text=None,
+            requires_human_handoff=False,
+            strategy="disabled_drop",
+        )
+
+
 def _coerce_float(value: Any) -> float | None:
     """Best-effort conversion to float for state numeric fields.
 

@@ -178,6 +178,17 @@ class ControlContractTests(unittest.TestCase):
         c2 = ExperimentConfig(run=run, arm=arm).digest()
         self.assertEqual(c1, c2)
 
+    def test_config_digest_changes_when_gate_tau_changes(self) -> None:
+        """Input: two configs differing only in gate_tau.
+
+        Expected output: digest strings are different.
+
+        中文翻译：输入：仅 gate_tau 不同的两个配置。"""
+        arm = resolve_arm("single")
+        c1 = ExperimentConfig(run=RunConfig(seed=7, gate_tau=0.2), arm=arm).digest()
+        c2 = ExperimentConfig(run=RunConfig(seed=7, gate_tau=0.8), arm=arm).digest()
+        self.assertNotEqual(c1, c2)
+
     def test_flat_multi_arm_removed(self) -> None:
         """Input: lookup for removed flat-multi arm key.
 
