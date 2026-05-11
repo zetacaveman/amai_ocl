@@ -1,0 +1,5 @@
+mode: benchmark
+dataset: configs/adversarial_buyers.json
+arms:
+  - single
+  - ocl_full

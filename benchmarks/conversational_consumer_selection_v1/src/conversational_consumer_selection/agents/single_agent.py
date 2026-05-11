@@ -383,7 +383,11 @@ class DemoPlatformAgentModel:
 
     def _clarification_priority(self, context: Mapping[str, Any]) -> list[str]:
         slots: list[str] = []
-        offers = list(context["offers"])
+        
+        feasible_offers = [
+            offer for offer in context["offers"] if self._is_explicitly_feasible(context, offer)
+        ]
+        offers_to_check = feasible_offers if feasible_offers else list(context["offers"])
 
         if CLARIFICATION_BUDGET_MAX in context["available_clarification_slots"]:
             slots.append(CLARIFICATION_BUDGET_MAX)
@@ -395,7 +399,7 @@ class DemoPlatformAgentModel:
         ]
         for slot in must_have_slots:
             constraint = slot[len(CLARIFICATION_MUST_HAVE_PREFIX) :]
-            values = {offer.get("features", {}).get(constraint) for offer in offers}
+            values = {offer.get("features", {}).get(constraint) for offer in offers_to_check}
             if len(values) > 1:
                 slots.append(slot)
 
@@ -407,7 +411,7 @@ class DemoPlatformAgentModel:
         for slot in preference_slots:
             attribute = slot[len(CLARIFICATION_PREFERENCE_PREFIX) :]
             values = {
-                float(offer.get("attribute_values", {}).get(attribute, 0.0)) for offer in offers
+                float(offer.get("attribute_values", {}).get(attribute, 0.0)) for offer in offers_to_check
             }
             if len(values) > 1:
                 slots.append(slot)

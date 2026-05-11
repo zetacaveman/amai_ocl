@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import re
+import time
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
@@ -156,7 +158,37 @@ class EnvAdapter:
 # ---------------------------------------------------------------------------
 
 
-def build_model_client(*, provider: str = "openai", model: str, api_key_env: str = OPENAI_API_KEY_ENV) -> Any:
+class RateLimitRetryWrapper:
+    """Wraps an LLM client to catch rate limits (429) and retry with backoff."""
+    
+    def __init__(self, client: Any, max_retries: int = 15, base_delay: float = 30.0, api_sleep_sec: float = 4.0):
+        self._client = client
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self.api_sleep_sec = api_sleep_sec
+
+    def generate(self, *args: Any, **kwargs: Any) -> Any:
+        for attempt in range(self.max_retries):
+            try:
+                result = self._client.generate(*args, **kwargs)
+                if self.api_sleep_sec > 0:
+                    time.sleep(self.api_sleep_sec)
+                return result
+            except Exception as e:
+                error_msg = str(e)
+                if "429" in error_msg or "RateLimitError" in error_msg:
+                    if attempt < self.max_retries - 1:
+                        delay = self.base_delay + (5.0 * attempt)
+                        print(f"\n[WARN] API Rate Limit hit (429). Sleeping for {delay}s before retry {attempt + 1}/{self.max_retries}...")
+                        time.sleep(delay)
+                        continue
+                raise
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+
+def build_model_client(*, provider: str = "openai", model: str, api_key_env: str = OPENAI_API_KEY_ENV, api_sleep_sec: float = 4.0) -> Any:
     """Instantiate a model client for the configured provider."""
     if provider != "openai":
         raise RuntimeError(f"Unsupported provider: '{provider}'. Supported: {SUPPORTED_PROVIDERS}")
@@ -167,7 +199,8 @@ def build_model_client(*, provider: str = "openai", model: str, api_key_env: str
     api_key = os.getenv(api_key_env)
     if not api_key:
         raise RuntimeError(f"{api_key_env} is not set.")
-    return OpenAILLM(model=model, api_key=api_key)
+    client = OpenAILLM(model=model, api_key=api_key)
+    return RateLimitRetryWrapper(client, api_sleep_sec=api_sleep_sec)
 
 
 def build_agents(
@@ -177,6 +210,7 @@ def build_agents(
     seller_min_price: float,
     provider: str = "openai",
     api_key_env: str = OPENAI_API_KEY_ENV,
+    api_sleep_sec: float = 4.0,
 ) -> tuple[Any, Any]:
     """Build AgenticPay buyer/seller agents. Returns (buyer, seller)."""
     try:
@@ -185,8 +219,8 @@ def build_agents(
     except ModuleNotFoundError as exc:
         raise RuntimeError(f"Missing dependency: {exc}") from exc
 
-    buyer_model = build_model_client(provider=provider, model=model, api_key_env=api_key_env)
-    seller_model = build_model_client(provider=provider, model=model, api_key_env=api_key_env)
+    buyer_model = build_model_client(provider=provider, model=model, api_key_env=api_key_env, api_sleep_sec=api_sleep_sec)
+    seller_model = build_model_client(provider=provider, model=model, api_key_env=api_key_env, api_sleep_sec=api_sleep_sec)
     buyer = BuyerAgent(model=buyer_model, buyer_max_price=buyer_max_price)
     seller = SellerAgent(model=seller_model, seller_min_price=seller_min_price)
     return buyer, seller

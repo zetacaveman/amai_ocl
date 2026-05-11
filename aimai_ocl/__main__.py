@@ -27,7 +27,26 @@ from aimai_ocl.statistics import (
 )
 
 
+class _TeeLogger:
+    def __init__(self, stream, file_path):
+        self.stream = stream
+        self.file = open(file_path, "a", encoding="utf-8")
+
+    def write(self, data):
+        self.stream.write(data)
+        self.file.write(data)
+        self.file.flush()
+
+    def flush(self):
+        self.stream.flush()
+        self.file.flush()
+
+
 def main() -> int:
+    Path("outputs").mkdir(parents=True, exist_ok=True)
+    sys.stdout = _TeeLogger(sys.stdout, "outputs/terminal_output.txt")
+    sys.stderr = _TeeLogger(sys.stderr, "outputs/terminal_output.txt")
+
     parser = argparse.ArgumentParser(prog="aimai_ocl", description="AiMai OCL experiment runner")
     parser.add_argument("command", choices=["run"], help="Command to execute")
     parser.add_argument("config", help="Path to experiment YAML config")
@@ -35,6 +54,8 @@ def main() -> int:
     parser.add_argument("--model", default=None, help="Override model id")
     parser.add_argument("--seed", type=int, default=None, help="Override seed")
     parser.add_argument("--episodes", type=int, default=None, help="Override episodes count")
+    parser.add_argument("--offset", type=int, default=0, help="Skip the first N episodes")
+    parser.add_argument("--api-sleep", type=float, default=None, help="Override API sleep time between requests (seconds)")
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -51,6 +72,8 @@ def main() -> int:
         cli_overrides["model"] = args.model
     if args.seed is not None:
         cli_overrides["seed"] = args.seed
+    if args.api_sleep is not None:
+        cli_overrides["api_sleep_sec"] = args.api_sleep
 
     # Resolve base config — try inherit path or default.yaml in same dir
     inherit_path = exp.get("inherit")
@@ -73,6 +96,8 @@ def main() -> int:
         return _run_ablation(run_config, exp, args)
     elif mode == "shapley":
         return _run_shapley(run_config, exp, args)
+    elif mode == "benchmark":
+        return _run_benchmark(run_config, exp, args)
     else:
         print(f"ERROR: Unknown mode '{mode}'", file=sys.stderr)
         return 1
@@ -137,6 +162,99 @@ def _run_batch(run_config: RunConfig, exp: dict, args: argparse.Namespace) -> in
     summaries = summarize_records(records)
     print("\n--- Summary ---")
     print(json.dumps(summaries, indent=2))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Mode: benchmark (Dataset driven)
+# ---------------------------------------------------------------------------
+
+def _run_benchmark(run_config: RunConfig, exp: dict, args: argparse.Namespace) -> int:
+    arm_names = exp.get("arms", ["single", "ocl_full"])
+    dataset_path = exp.get("dataset", "configs/adversarial_buyers.json")
+    seed_base = run_config.seed
+
+    try:
+        with open(dataset_path, "r", encoding="utf-8") as f:
+            dataset = json.load(f)
+    except Exception as e:
+        print(f"ERROR: Failed to load dataset {dataset_path}: {e}", file=sys.stderr)
+        return 1
+
+    offset = args.offset
+    if args.episodes is not None:
+        dataset = dataset[offset : offset + args.episodes]
+    else:
+        dataset = dataset[offset:]
+
+    records: list[dict[str, Any]] = []
+    out_file = Path("outputs/benchmark_results.json")
+    if out_file.exists() and offset > 0:
+        try:
+            with open(out_file, "r", encoding="utf-8") as f:
+                existing_data = json.load(f)
+                records = existing_data.get("records", [])
+        except Exception as e:
+            print(f"Warning: Failed to load existing results: {e}", file=sys.stderr)
+
+    for i, profile in enumerate(dataset):
+        actual_i = i + offset
+        persona_type = profile.get("persona_type", "unknown")
+        print(f"\n=== Profile {actual_i+1} (Offset {offset}): [{persona_type}] {profile.get('name')} ===")
+
+        for arm_name in arm_names:
+            arm = _resolve_arm(arm_name, exp)
+            seed = seed_base + actual_i
+
+            rc_kwargs = run_config.to_dict()
+            rc_kwargs["user_profile"] = profile.get("description", "")
+            rc_kwargs["seed"] = seed
+            rc = RunConfig(**rc_kwargs)
+
+            t0 = time.time()
+            trace, info = _run_one_episode(rc, arm)
+            elapsed = time.time() - t0
+            vs = collect_violation_stats(trace)
+            records.append({
+                "arm": arm.name, "episode_index": actual_i, "persona_type": persona_type,
+                "seed": seed, "success": success_from_status(info.get("status")),
+                "round": info.get("round"), "seller_reward": info.get("seller_reward"),
+                "latency_sec": round(elapsed, 2), "audit_events": len(trace.events),
+                **vs,
+            })
+            print(f"  [{arm.name}] status={info.get('status')}, reward={info.get('seller_reward')}, {elapsed:.1f}s")
+            
+            log_file = Path("outputs/conversation_logs.txt")
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(f"\n{'='*70}\n")
+                f.write(f"Buyer: {profile.get('name')} | Persona: {persona_type} | Arm: {arm.name}\n")
+                f.write(f"{'='*70}\n")
+                for event in trace.events:
+                    ev_type = getattr(event.event_type, "name", str(event.event_type))
+                    f.write(f"[{ev_type}] {event.summary}\n")
+                    details = getattr(event, "details", None)
+                    if details:
+                        if isinstance(details, dict) and "action" in details and isinstance(details["action"], dict) and "final_text" in details["action"]:
+                            f.write(f"    🗣️ Message: {details['action']['final_text']}\n")
+                        else:
+                            f.write(f"    ⚙️ Details: {json.dumps(details, ensure_ascii=False)}\n")
+                f.write(f"\n[FINAL STATUS] {info.get('status')} | Seller Reward: {info.get('seller_reward')}\n\n")
+        
+        out_file = Path("outputs/benchmark_results.json")
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_file, "w", encoding="utf-8") as f:
+            json.dump({"records": records, "summaries": summarize_records(records)}, f, indent=2)
+
+    summaries = summarize_records(records)
+    print("\n--- Benchmark Summary ---")
+    print(json.dumps(summaries, indent=2))
+    
+    out_file = Path("outputs/benchmark_results.json")
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_file, "w", encoding="utf-8") as f:
+        json.dump({"records": records, "summaries": summaries}, f, indent=2)
+    print(f"\nDetailed results saved to {out_file}")
     return 0
 
 
@@ -282,6 +400,7 @@ def _run_one_episode(
         seller_min_price=run_config.seller_min_price,
         provider=run_config.provider,
         api_key_env=run_config.api_key_env,
+        api_sleep_sec=run_config.api_sleep_sec,
     )
     random.seed(run_config.seed)
 

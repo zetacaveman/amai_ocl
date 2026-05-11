@@ -25,6 +25,7 @@ class RunConfig:
     model: str = "gpt-4o-mini"
     provider: str = "openai"
     api_key_env: str = "OPENAI_API_KEY"
+    api_sleep_sec: float = 4.0
     seed: int = 42
     max_rounds: int = 10
     initial_seller_price: float = 180.0

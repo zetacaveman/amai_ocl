@@ -61,3 +61,4 @@ docs/
 !/README.md
 !/readme_cn.md
 !/benchmarks/conversational_consumer_selection_v1/README.md
+local.txt
