@@ -125,6 +125,15 @@ def run_episode(
                 audit_policy=policy,
             )
 
+        if seller_text is not None:
+            trace.metadata.setdefault("executed_seller_actions", []).append(
+                {
+                    "round_id": round_id,
+                    "actor_id": seller_actor_id,
+                    "text": seller_text,
+                }
+            )
+
         observation, _, terminated, truncated, final_info = adapter.step(
             buyer_action=buyer_text, seller_action=seller_text,
         )

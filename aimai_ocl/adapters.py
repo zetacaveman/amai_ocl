@@ -176,6 +176,11 @@ class RateLimitRetryWrapper:
                 return result
             except Exception as e:
                 error_msg = str(e)
+                if self._should_retry_with_max_completion_tokens(error_msg, kwargs):
+                    result = self._generate_with_max_completion_tokens(*args, **kwargs)
+                    if self.api_sleep_sec > 0:
+                        time.sleep(self.api_sleep_sec)
+                    return result
                 if "429" in error_msg or "RateLimitError" in error_msg:
                     if attempt < self.max_retries - 1:
                         delay = self.base_delay + (5.0 * attempt)
@@ -183,6 +188,42 @@ class RateLimitRetryWrapper:
                         time.sleep(delay)
                         continue
                 raise
+
+    def _should_retry_with_max_completion_tokens(
+        self,
+        error_msg: str,
+        kwargs: dict[str, Any],
+    ) -> bool:
+        return (
+            "Unsupported parameter: 'max_tokens'" in error_msg
+            and "max_tokens" in kwargs
+            and "max_completion_tokens" not in kwargs
+            and hasattr(self._client, "client")
+            and hasattr(self._client, "model")
+        )
+
+    def _generate_with_max_completion_tokens(self, *args: Any, **kwargs: Any) -> str:
+        prompt = kwargs.get("prompt")
+        if prompt is None and args:
+            prompt = args[0]
+        if prompt is None:
+            raise RuntimeError("OpenAI compatibility fallback could not recover prompt.")
+
+        temperature = kwargs.get("temperature", 0.7)
+        max_tokens = kwargs.get("max_tokens")
+        passthrough_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key not in {"prompt", "temperature", "max_tokens"}
+        }
+        response = self._client.client.chat.completions.create(
+            model=self._client.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+            max_completion_tokens=max_tokens,
+            **passthrough_kwargs,
+        )
+        return response.choices[0].message.content.strip()
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._client, name)

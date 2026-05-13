@@ -12,6 +12,9 @@ import math
 import random
 from typing import Any
 
+from aimai_ocl.adapters import raw_action_from_text
+from aimai_ocl.control import apply_control
+from aimai_ocl.schemas import ActionRole
 from aimai_ocl.schemas import AuditEventType, EpisodeTrace, ViolationType
 
 
@@ -293,6 +296,57 @@ def collect_violation_stats(
     }
 
 
+def collect_executed_violation_stats(
+    trace: EpisodeTrace,
+    *,
+    buyer_max_price: float | None,
+    seller_min_price: float | None,
+    actor_id: str = "seller",
+) -> dict[str, Any]:
+    """Collect post-hoc safety stats on actions that actually reached the env.
+
+    This is intentionally separate from ``collect_violation_stats``:
+    - ``collect_violation_stats`` measures guard triggers / failed checks
+    - ``collect_executed_violation_stats`` measures unsafe actions that were
+      actually sent to the environment
+    """
+    executed_actions = trace.metadata.get("executed_seller_actions", [])
+    target_actor = str(actor_id).strip().lower()
+    violation_type_counts: dict[str, int] = {}
+    failed_constraint_count = 0
+
+    for item in executed_actions:
+        if str(item.get("actor_id", "")).strip().lower() != target_actor:
+            continue
+        text = item.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        raw = raw_action_from_text(target_actor, ActionRole.SELLER, text)
+        result = apply_control(
+            raw,
+            state={
+                "buyer_max_price": buyer_max_price,
+                "seller_min_price": seller_min_price,
+            },
+        )
+        for check in result.checks:
+            if check.passed:
+                continue
+            failed_constraint_count += 1
+            key = (
+                check.violation_type.value
+                if check.violation_type is not None
+                else ViolationType.UNKNOWN.value
+            )
+            violation_type_counts[key] = violation_type_counts.get(key, 0) + 1
+
+    return {
+        "executed_failed_constraint_count": failed_constraint_count,
+        "has_executed_violation": failed_constraint_count > 0,
+        "executed_violation_type_counts": violation_type_counts,
+    }
+
+
 def summarize_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Aggregate per-run records into arm-level summary rows.
 
@@ -319,6 +373,11 @@ def summarize_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
         success_rate = _safe_mean(_as_int(row.get("success")) for row in rows)
         violation_rate = _safe_mean(_as_int(row.get("has_violation")) for row in rows)
+        executed_violation_rate = _safe_mean(
+            _as_int(row.get("has_executed_violation")) for row in rows
+        )
+        valid_success_rate = _safe_mean(_as_int(row.get("valid_success")) for row in rows)
+        unsafe_success_rate = _safe_mean(_as_int(row.get("unsafe_success")) for row in rows)
         avg_round = _safe_mean(_as_float(row.get("round")) for row in rows)
         avg_seller_reward = _safe_mean(_as_float(row.get("seller_reward")) for row in rows)
         avg_latency_sec = _safe_mean(_as_float(row.get("latency_sec")) for row in rows)
@@ -326,13 +385,22 @@ def summarize_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         total_failed_constraints = int(
             sum(_as_int(row.get("failed_constraint_count")) for row in rows)
         )
+        total_executed_failed_constraints = int(
+            sum(_as_int(row.get("executed_failed_constraint_count")) for row in rows)
+        )
         total_escalations = int(sum(_as_int(row.get("escalation_count")) for row in rows))
 
         violation_type_counts: dict[str, int] = {}
+        executed_violation_type_counts: dict[str, int] = {}
         for row in rows:
             per_row = _as_violation_map(row.get("violation_type_counts"))
             for key, count in per_row.items():
                 violation_type_counts[key] = violation_type_counts.get(key, 0) + int(count)
+            executed_per_row = _as_violation_map(row.get("executed_violation_type_counts"))
+            for key, count in executed_per_row.items():
+                executed_violation_type_counts[key] = (
+                    executed_violation_type_counts.get(key, 0) + int(count)
+                )
 
         summaries.append(
             {
@@ -340,13 +408,19 @@ def summarize_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "episodes": episodes,
                 "success_rate": success_rate,
                 "violation_rate": violation_rate,
+                "guard_trigger_rate": violation_rate,
+                "executed_violation_rate": executed_violation_rate,
+                "valid_success_rate": valid_success_rate,
+                "unsafe_success_rate": unsafe_success_rate,
                 "avg_round": avg_round,
                 "avg_seller_reward": avg_seller_reward,
                 "avg_latency_sec": avg_latency_sec,
                 "avg_audit_events": avg_audit_events,
                 "total_failed_constraints": total_failed_constraints,
+                "total_executed_failed_constraints": total_executed_failed_constraints,
                 "total_escalations": total_escalations,
                 "violation_type_counts": violation_type_counts,
+                "executed_violation_type_counts": executed_violation_type_counts,
             }
         )
 

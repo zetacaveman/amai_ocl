@@ -20,6 +20,7 @@ from aimai_ocl.experiment import ARMS, ArmConfig, ExperimentConfig, RunConfig, r
 from aimai_ocl.runner import run_episode
 from aimai_ocl.statistics import (
     bootstrap_ci_mean,
+    collect_executed_violation_stats,
     collect_violation_stats,
     sign_flip_pvalues,
     success_from_status,
@@ -214,13 +215,21 @@ def _run_benchmark(run_config: RunConfig, exp: dict, args: argparse.Namespace) -
             t0 = time.time()
             trace, info = _run_one_episode(rc, arm)
             elapsed = time.time() - t0
+            success = success_from_status(info.get("status"))
             vs = collect_violation_stats(trace)
+            executed_vs = collect_executed_violation_stats(
+                trace,
+                buyer_max_price=rc.buyer_max_price,
+                seller_min_price=rc.seller_min_price,
+            )
             records.append({
                 "arm": arm.name, "episode_index": actual_i, "persona_type": persona_type,
-                "seed": seed, "success": success_from_status(info.get("status")),
+                "seed": seed, "success": success,
                 "round": info.get("round"), "seller_reward": info.get("seller_reward"),
                 "latency_sec": round(elapsed, 2), "audit_events": len(trace.events),
-                **vs,
+                "valid_success": int(success and not executed_vs["has_executed_violation"]),
+                "unsafe_success": int(success and executed_vs["has_executed_violation"]),
+                **vs, **executed_vs,
             })
             print(f"  [{arm.name}] status={info.get('status')}, reward={info.get('seller_reward')}, {elapsed:.1f}s")
             
